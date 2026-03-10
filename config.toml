@@ -1,0 +1,57 @@
+[exchange]
+rest_url = "https://api.polymarket.example"
+ws_url = "wss://ws.polymarket.example"
+network = "polygon"
+api_key = ""
+api_secret = ""
+wallet_address = "0xYOUR_WALLET_ADDRESS"
+wallet_private_key = ""
+
+[markets]
+selection_mode = "top_liquidity"
+refresh_secs = 30
+min_markets = 10
+symbols = [
+  "POLY-MKT-001",
+  "POLY-MKT-002",
+  "POLY-MKT-003",
+  "POLY-MKT-004",
+  "POLY-MKT-005",
+  "POLY-MKT-006",
+  "POLY-MKT-007",
+  "POLY-MKT-008",
+  "POLY-MKT-009",
+  "POLY-MKT-010",
+  "POLY-MKT-011",
+  "POLY-MKT-012",
+]
+
+[risk]
+global_drawdown_stop_pct = 0.25
+max_per_market_exposure = 20.0
+max_open_orders = 120
+stale_quote_timeout_ms = 2000
+heartbeat_timeout_ms = 5000
+kill_switch = false
+max_adverse_fills_in_window = 4
+circuit_window_secs = 30
+max_slippage_bps = 20.0
+
+[execution]
+post_only = true
+order_ttl_ms = 1500
+max_retries = 2
+fill_fee_bps = 2.0
+
+[strategy]
+target_spread_bps = 30.0
+inventory_skew_bps = 12.0
+quote_sizes = [1.0, 2.0, 3.0]
+refresh_interval_ms = 750
+
+[logging]
+output_dir = "logs"
+
+[bankroll]
+starting_cash = 400.0
+live_tranche_cash = 100.0
