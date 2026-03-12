@@ -59,6 +59,31 @@ impl ClobOrderbookLevel {
     }
 }
 
+/// Server time response from CLOB.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClobServerTime {
+    pub epoch_ms: i64,
+}
+
+/// Fee rate response in basis points.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClobFeeRate {
+    pub fee_rate_bps: f64,
+}
+
+/// Tick size response for markets/tokens.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClobTickSize {
+    pub tick_size: f64,
+}
+
+/// Price point from historical market prices endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PriceHistoryPoint {
+    pub timestamp: DateTime<Utc>,
+    pub price: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Order types (POST /order, GET /orders)
 // ---------------------------------------------------------------------------
@@ -199,24 +224,30 @@ pub struct WsTradeEvent {
 pub struct WsSubscription {
     #[serde(rename = "type")]
     pub msg_type: String,
-    pub channel: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assets_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_feature_enabled: Option<bool>,
 }
 
 impl WsSubscription {
-    pub fn book(token_ids: Vec<String>) -> Self {
+    pub fn market(token_ids: Vec<String>) -> Self {
         Self {
-            msg_type: "subscribe".to_string(),
-            channel: "book".to_string(),
+            msg_type: "market".to_string(),
             assets_ids: token_ids,
+            asset_ids: None,
+            custom_feature_enabled: Some(true),
         }
     }
 
-    pub fn trade(token_ids: Vec<String>) -> Self {
+    pub fn market_legacy(token_ids: Vec<String>) -> Self {
         Self {
-            msg_type: "subscribe".to_string(),
-            channel: "trade".to_string(),
-            assets_ids: token_ids,
+            msg_type: "market".to_string(),
+            assets_ids: Vec::new(),
+            asset_ids: Some(token_ids),
+            custom_feature_enabled: Some(true),
         }
     }
 }
@@ -225,8 +256,8 @@ impl WsSubscription {
 // Conversion helpers: CLOB types → internal MarketEvent types
 // ---------------------------------------------------------------------------
 
-use crate::types::Side;
 use crate::market_data::MarketEvent;
+use crate::types::Side;
 
 impl WsBookDelta {
     /// Convert a book delta into a MarketEvent::BookUpdate using best bid/ask.
@@ -258,7 +289,19 @@ impl WsBookDelta {
         Some(MarketEvent::BookUpdate {
             market: self.asset_id.clone(),
             bid: best_bid,
+            bid_size: self
+                .bids
+                .as_ref()
+                .and_then(|b| b.first())
+                .map(|l| l.size_f64())
+                .unwrap_or(0.0),
             ask: best_ask,
+            ask_size: self
+                .asks
+                .as_ref()
+                .and_then(|a| a.first())
+                .map(|l| l.size_f64())
+                .unwrap_or(0.0),
             timestamp: ts,
         })
     }

@@ -61,10 +61,10 @@ impl PolymarketSigner {
         ctf_exchange_address: &str,
         neg_risk_ctf_exchange_address: &str,
     ) -> Result<Self> {
-        let key_hex = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
-        let wallet: PrivateKeySigner = key_hex
-            .parse()
-            .context("failed to parse private key")?;
+        let key_hex = private_key_hex
+            .strip_prefix("0x")
+            .unwrap_or(private_key_hex);
+        let wallet: PrivateKeySigner = key_hex.parse().context("failed to parse private key")?;
 
         let maker_address = wallet.address();
         let ctf_exchange: Address = ctf_exchange_address
@@ -102,8 +102,15 @@ impl PolymarketSigner {
         };
 
         let token_id = U256::from_str_radix(
-            params.token_id.strip_prefix("0x").unwrap_or(&params.token_id),
-            if params.token_id.starts_with("0x") { 16 } else { 10 },
+            params
+                .token_id
+                .strip_prefix("0x")
+                .unwrap_or(&params.token_id),
+            if params.token_id.starts_with("0x") {
+                16
+            } else {
+                10
+            },
         )
         .context("invalid token_id")?;
 

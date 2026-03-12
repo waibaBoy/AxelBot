@@ -99,7 +99,11 @@ impl PortfolioSnapshot {
                 if pos.qty.abs() < f64::EPSILON {
                     return 0.0;
                 }
-                let mid = self.mid_prices.get(market).copied().unwrap_or(pos.avg_price);
+                let mid = self
+                    .mid_prices
+                    .get(market)
+                    .copied()
+                    .unwrap_or(pos.avg_price);
                 if pos.qty > 0.0 {
                     (mid - pos.avg_price) * pos.qty
                 } else {

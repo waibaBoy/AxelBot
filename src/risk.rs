@@ -16,9 +16,17 @@ pub enum RiskRejectReason {
         projected: f64,
         limit: f64,
     },
+    GlobalExposureLimit {
+        projected_total: f64,
+        limit: f64,
+    },
     MaxOpenOrders {
         current: usize,
         limit: usize,
+    },
+    OrderVelocity {
+        current_per_sec: usize,
+        limit_per_sec: usize,
     },
     StaleQuote {
         age_ms: i64,
@@ -57,6 +65,7 @@ pub struct RiskEngine {
     halt_reason: Option<String>,
     halted_markets: HashSet<String>,
     adverse_fill_times: HashMap<String, VecDeque<DateTime<Utc>>>,
+    order_submit_times: VecDeque<DateTime<Utc>>,
 }
 
 impl RiskEngine {
@@ -75,6 +84,7 @@ impl RiskEngine {
             halt_reason,
             halted_markets: HashSet::new(),
             adverse_fill_times: HashMap::new(),
+            order_submit_times: VecDeque::new(),
         }
     }
 
@@ -96,7 +106,7 @@ impl RiskEngine {
     }
 
     pub fn check_pre_trade(
-        &self,
+        &mut self,
         req: &OrderRequest,
         now: DateTime<Utc>,
         inventory_by_market: &HashMap<String, f64>,
@@ -118,6 +128,14 @@ impl RiskEngine {
                 limit: self.cfg.max_open_orders,
             });
         }
+        self.prune_order_velocity_window(now);
+        let current_per_sec = self.order_submit_times.len();
+        if current_per_sec >= self.cfg.max_orders_per_sec {
+            return RiskDecision::reject(RiskRejectReason::OrderVelocity {
+                current_per_sec,
+                limit_per_sec: self.cfg.max_orders_per_sec,
+            });
+        }
         let age_ms = (now - req.quote_ts).num_milliseconds();
         if age_ms > self.cfg.stale_quote_timeout_ms {
             return RiskDecision::reject(RiskRejectReason::StaleQuote {
@@ -134,6 +152,28 @@ impl RiskEngine {
                 limit: self.cfg.max_per_market_exposure,
             });
         }
+        let projected_total = inventory_by_market
+            .iter()
+            .map(|(m, q)| {
+                if m == &req.market {
+                    projected_inventory.abs()
+                } else {
+                    q.abs()
+                }
+            })
+            .sum::<f64>()
+            + if inventory_by_market.contains_key(&req.market) {
+                0.0
+            } else {
+                projected_inventory.abs()
+            };
+        if projected_total > self.cfg.max_total_exposure {
+            return RiskDecision::reject(RiskRejectReason::GlobalExposureLimit {
+                projected_total,
+                limit: self.cfg.max_total_exposure,
+            });
+        }
+        self.order_submit_times.push_back(now);
         RiskDecision::allow()
     }
 
@@ -190,6 +230,17 @@ impl RiskEngine {
             self.halted_markets.insert(fill.market.clone());
         }
     }
+
+    fn prune_order_velocity_window(&mut self, now: DateTime<Utc>) {
+        let window_start = now - Duration::seconds(1);
+        while let Some(front) = self.order_submit_times.front().copied() {
+            if front < window_start {
+                self.order_submit_times.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -202,7 +253,9 @@ mod tests {
         RiskConfig {
             global_drawdown_stop_pct: 0.25,
             max_per_market_exposure: 25.0,
+            max_total_exposure: 100.0,
             max_open_orders: 4,
+            max_orders_per_sec: 10,
             stale_quote_timeout_ms: 1_000,
             heartbeat_timeout_ms: 5_000,
             kill_switch: false,
@@ -221,10 +274,11 @@ mod tests {
 
     #[test]
     fn per_market_exposure_rejected() {
-        let risk = RiskEngine::new(base_cfg(), 100.0);
+        let mut risk = RiskEngine::new(base_cfg(), 100.0);
         let now = Utc::now();
         let req = OrderRequest {
             market: "M1".to_string(),
+            token_id: None,
             side: Side::Bid,
             price: 0.5,
             size: 10.0,
@@ -242,10 +296,11 @@ mod tests {
 
     #[test]
     fn max_open_orders_rejected() {
-        let risk = RiskEngine::new(base_cfg(), 100.0);
+        let mut risk = RiskEngine::new(base_cfg(), 100.0);
         let now = Utc::now();
         let req = OrderRequest {
             market: "M1".to_string(),
+            token_id: None,
             side: Side::Bid,
             price: 0.5,
             size: 1.0,
@@ -256,6 +311,29 @@ mod tests {
         assert!(matches!(
             decision.reason,
             Some(RiskRejectReason::MaxOpenOrders { .. })
+        ));
+    }
+
+    #[test]
+    fn global_exposure_rejected() {
+        let mut cfg = base_cfg();
+        cfg.max_total_exposure = 21.0;
+        let mut risk = RiskEngine::new(cfg, 100.0);
+        let now = Utc::now();
+        let req = OrderRequest {
+            market: "M2".to_string(),
+            token_id: None,
+            side: Side::Bid,
+            price: 0.5,
+            size: 5.0,
+            quote_ts: now,
+        };
+        let inv = HashMap::from([("M1".to_string(), 10.0), ("M2".to_string(), 8.0)]);
+        let decision = risk.check_pre_trade(&req, now, &inv, 0);
+        assert!(!decision.allowed);
+        assert!(matches!(
+            decision.reason,
+            Some(RiskRejectReason::GlobalExposureLimit { .. })
         ));
     }
 }

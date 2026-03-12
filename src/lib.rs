@@ -1,5 +1,6 @@
 pub mod backtest;
 pub mod config;
+pub mod dashboard;
 pub mod execution;
 pub mod market_data;
 pub mod polymarket;

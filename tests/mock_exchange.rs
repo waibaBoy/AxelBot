@@ -13,7 +13,9 @@ fn risk_cfg() -> RiskConfig {
     RiskConfig {
         global_drawdown_stop_pct: 0.25,
         max_per_market_exposure: 100.0,
+        max_total_exposure: 500.0,
         max_open_orders: 500,
+        max_orders_per_sec: 200,
         stale_quote_timeout_ms: 2_000,
         heartbeat_timeout_ms: 10_000,
         kill_switch: false,
@@ -38,7 +40,7 @@ fn build_engine() -> (ExecutionEngine<SimulatedExchangeClient>, JsonlLogger) {
     let logger = JsonlLogger::new(&log_dir, "integration").expect("logger");
     let risk = RiskEngine::new(risk_cfg(), 1_000.0);
     let client = SimulatedExchangeClient::new(2.0);
-    let engine = ExecutionEngine::new(client, execution_cfg(), risk, 1_000.0);
+    let engine = ExecutionEngine::new(client, execution_cfg(), risk, 1_000.0, true);
     (engine, logger)
 }
 

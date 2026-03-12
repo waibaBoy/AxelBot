@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "polymarket-public": {
+      "type": "stdio",
+      "command": "polymarket-mcp",
+      "args": [
+        "serve"
+      ],
+      "env": {
+        "RUST_LOG": "info",
+        "POLYMARKET_API_BASE_URL": "https://gamma-api.polymarket.com"
+      }
+    }
+  }
+}

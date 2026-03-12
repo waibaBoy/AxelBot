@@ -11,10 +11,13 @@ use crate::types::Side;
 pub struct MarketSnapshot {
     pub market: String,
     pub bid: f64,
+    pub bid_size: f64,
     pub ask: f64,
+    pub ask_size: f64,
     pub mid: f64,
     pub fair_value: f64,
     pub spread_bps: f64,
+    pub imbalance: f64,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -23,7 +26,9 @@ pub enum MarketEvent {
     BookUpdate {
         market: String,
         bid: f64,
+        bid_size: f64,
         ask: f64,
+        ask_size: f64,
         timestamp: DateTime<Utc>,
     },
     Trade {
@@ -38,15 +43,19 @@ pub enum MarketEvent {
 #[derive(Debug, Clone, Default)]
 struct LocalBook {
     bid: f64,
+    bid_size: f64,
     ask: f64,
+    ask_size: f64,
     fair: f64,
     last_ts: Option<DateTime<Utc>>,
 }
 
 impl LocalBook {
-    fn update_book(&mut self, bid: f64, ask: f64, ts: DateTime<Utc>) {
+    fn update_book(&mut self, bid: f64, bid_size: f64, ask: f64, ask_size: f64, ts: DateTime<Utc>) {
         self.bid = bid;
+        self.bid_size = bid_size.max(0.0);
         self.ask = ask;
+        self.ask_size = ask_size.max(0.0);
         let mid = (bid + ask) * 0.5;
         if self.fair <= 0.0 {
             self.fair = mid;
@@ -79,7 +88,9 @@ impl MarketDataCache {
                 market.clone(),
                 LocalBook {
                     bid: 0.49,
+                    bid_size: 10.0,
                     ask: 0.51,
+                    ask_size: 10.0,
                     fair: 0.50,
                     last_ts: None,
                 },
@@ -96,12 +107,14 @@ impl MarketDataCache {
             MarketEvent::BookUpdate {
                 market,
                 bid,
+                bid_size,
                 ask,
+                ask_size,
                 timestamp,
             } => {
                 let book = self.books.entry(market.clone()).or_default();
-                book.update_book(bid, ask, timestamp);
-                self.last_global_update = Some(timestamp);
+                book.update_book(bid, bid_size, ask, ask_size, timestamp);
+                self.last_global_update = Some(Utc::now());
                 Some(Self::to_snapshot(&market, book, timestamp))
             }
             MarketEvent::Trade {
@@ -113,7 +126,7 @@ impl MarketDataCache {
             } => {
                 let book = self.books.entry(market.clone()).or_default();
                 book.update_trade(price, size, side, timestamp);
-                self.last_global_update = Some(timestamp);
+                self.last_global_update = Some(Utc::now());
                 if book.bid > 0.0 && book.ask > 0.0 {
                     Some(Self::to_snapshot(&market, book, timestamp))
                 } else {
@@ -130,13 +143,22 @@ impl MarketDataCache {
         } else {
             0.0
         };
+        let depth_sum = book.bid_size + book.ask_size;
+        let imbalance = if depth_sum > 0.0 {
+            (book.bid_size - book.ask_size) / depth_sum
+        } else {
+            0.0
+        };
         MarketSnapshot {
             market: market.to_string(),
             bid: book.bid,
+            bid_size: book.bid_size,
             ask: book.ask,
+            ask_size: book.ask_size,
             mid,
             fair_value: if book.fair > 0.0 { book.fair } else { mid },
             spread_bps,
+            imbalance,
             timestamp: ts,
         }
     }
@@ -214,7 +236,9 @@ impl MarketDataSource for SimulatedMarketDataSource {
             Ok(MarketEvent::BookUpdate {
                 market,
                 bid,
+                bid_size: 5.0 + ((self.tick % 9) as f64),
                 ask,
+                ask_size: 5.0 + (((self.tick + 3) % 9) as f64),
                 timestamp: self.now,
             })
         }

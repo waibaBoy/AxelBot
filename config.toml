@@ -1,6 +1,6 @@
 [exchange]
-rest_url = "https://api.polymarket.example"
-ws_url = "wss://ws.polymarket.example"
+rest_url = "https://clob.polymarket.com"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 network = "polygon"
 api_key = ""
 api_secret = ""
@@ -29,7 +29,9 @@ symbols = [
 [risk]
 global_drawdown_stop_pct = 0.25
 max_per_market_exposure = 20.0
+max_total_exposure = 80.0
 max_open_orders = 120
+max_orders_per_sec = 25
 stale_quote_timeout_ms = 2000
 heartbeat_timeout_ms = 5000
 kill_switch = false

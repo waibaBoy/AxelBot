@@ -20,12 +20,8 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_path(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path).with_context(|| {
-            format!(
-                "failed to read config file at {}",
-                path.to_string_lossy()
-            )
-        })?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file at {}", path.to_string_lossy()))?;
         let mut config: AppConfig =
             toml::from_str(&raw).context("failed to deserialize config.toml")?;
         config.apply_env_overrides();
@@ -51,7 +47,11 @@ impl AppConfig {
     }
 
     fn empty_to_none(slot: &mut Option<String>) {
-        if slot.as_deref().map(|s| s.trim().is_empty()).unwrap_or(false) {
+        if slot
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false)
+        {
             *slot = None;
         }
     }
@@ -72,6 +72,12 @@ impl AppConfig {
         }
         if !(0.0..1.0).contains(&self.risk.global_drawdown_stop_pct) {
             return Err(anyhow!("risk.global_drawdown_stop_pct must be in (0, 1)"));
+        }
+        if self.risk.max_total_exposure <= 0.0 {
+            return Err(anyhow!("risk.max_total_exposure must be positive"));
+        }
+        if self.risk.max_orders_per_sec == 0 {
+            return Err(anyhow!("risk.max_orders_per_sec must be >= 1"));
         }
         if self.strategy.target_spread_bps <= 0.0 {
             return Err(anyhow!("strategy.target_spread_bps must be positive"));
@@ -124,7 +130,11 @@ pub struct MarketUniverseConfig {
 pub struct RiskConfig {
     pub global_drawdown_stop_pct: f64,
     pub max_per_market_exposure: f64,
+    #[serde(default = "default_max_total_exposure")]
+    pub max_total_exposure: f64,
     pub max_open_orders: usize,
+    #[serde(default = "default_max_orders_per_sec")]
+    pub max_orders_per_sec: usize,
     pub stale_quote_timeout_ms: i64,
     pub heartbeat_timeout_ms: i64,
     pub kill_switch: bool,
@@ -178,9 +188,16 @@ impl Default for PolymarketConfig {
         Self {
             chain_id: 137,
             ctf_exchange_address: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".to_string(),
-            neg_risk_ctf_exchange_address: "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-                .to_string(),
+            neg_risk_ctf_exchange_address: "0xC5d563A36AE78145C45a50134d48A1215220f80a".to_string(),
             collateral_token_address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".to_string(),
         }
     }
+}
+
+fn default_max_total_exposure() -> f64 {
+    1_000_000_000.0
+}
+
+fn default_max_orders_per_sec() -> usize {
+    25
 }
