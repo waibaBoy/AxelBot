@@ -180,7 +180,11 @@ impl PolymarketWsSource {
                     info!(snippet = %snippet, "ws_unknown_frame");
                 }
                 // Legacy channels occasionally omit event_type and provide shape-only payloads.
-                if v.get("bids").is_some() || v.get("asks").is_some() {
+                if v.get("bids").is_some()
+                    || v.get("asks").is_some()
+                    || (v.get("best_bid").is_some() && v.get("best_ask").is_some())
+                    || (v.get("bestBid").is_some() && v.get("bestAsk").is_some())
+                {
                     return self
                         .parse_book_event_value(v)
                         .map(|evt| self.remap_market(evt));

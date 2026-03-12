@@ -728,7 +728,7 @@ impl HybridLiveSource {
 impl MarketDataSource for HybridLiveSource {
     async fn next_event(&mut self) -> Result<crate::market_data::MarketEvent> {
         if self.ws_enabled {
-            match timeout(StdDuration::from_millis(5_000), self.ws.next_event()).await {
+            match timeout(StdDuration::from_millis(60_000), self.ws.next_event()).await {
                 Ok(Ok(event)) => return Ok(event),
                 Ok(Err(err)) => {
                     warn!(
@@ -738,7 +738,7 @@ impl MarketDataSource for HybridLiveSource {
                     self.ws_enabled = false;
                 }
                 Err(_) => {
-                    warn!("ws market data stream timed out, falling back to REST polling");
+                    warn!("ws market data stream timed out (60s), falling back to REST polling");
                     self.ws_enabled = false;
                 }
             }
