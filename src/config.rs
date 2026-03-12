@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub risk: RiskConfig,
     pub execution: ExecutionConfig,
     pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub news: NewsConfig,
     pub logging: LoggingConfig,
     pub bankroll: BankrollConfig,
     #[serde(default)]
@@ -34,6 +36,7 @@ impl AppConfig {
         Self::empty_to_none(&mut self.exchange.api_key);
         Self::empty_to_none(&mut self.exchange.api_secret);
         Self::empty_to_none(&mut self.exchange.wallet_private_key);
+        Self::empty_to_none(&mut self.news.guardian_api_key);
 
         if self.markets.symbols.len() < self.markets.min_markets {
             let mut idx = self.markets.symbols.len();
@@ -85,6 +88,15 @@ impl AppConfig {
         if self.strategy.quote_sizes.is_empty() {
             return Err(anyhow!("strategy.quote_sizes cannot be empty"));
         }
+        if self.news.poll_secs == 0 {
+            return Err(anyhow!("news.poll_secs must be >= 1"));
+        }
+        if self.news.max_articles == 0 {
+            return Err(anyhow!("news.max_articles must be >= 1"));
+        }
+        if self.news.max_bias_bps < 0.0 {
+            return Err(anyhow!("news.max_bias_bps must be non-negative"));
+        }
         if self.bankroll.starting_cash <= 0.0 {
             return Err(anyhow!("bankroll.starting_cash must be positive"));
         }
@@ -103,6 +115,12 @@ impl AppConfig {
         }
         if let Ok(v) = env::var("AXELBOT_KILL_SWITCH") {
             self.risk.kill_switch = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = env::var("AXELBOT_NEWS_ENABLED") {
+            self.news.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = env::var("AXELBOT_GUARDIAN_API_KEY") {
+            self.news.guardian_api_key = Some(v);
         }
     }
 }
@@ -160,6 +178,40 @@ pub struct StrategyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsConfig {
+    pub enabled: bool,
+    #[serde(default = "default_guardian_endpoint")]
+    pub guardian_endpoint: String,
+    #[serde(default)]
+    pub guardian_api_key: Option<String>,
+    #[serde(default = "default_news_query")]
+    pub query: String,
+    #[serde(default = "default_news_poll_secs")]
+    pub poll_secs: u64,
+    #[serde(default = "default_news_lookback_minutes")]
+    pub lookback_minutes: i64,
+    #[serde(default = "default_news_max_articles")]
+    pub max_articles: usize,
+    #[serde(default = "default_news_max_bias_bps")]
+    pub max_bias_bps: f64,
+}
+
+impl Default for NewsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            guardian_endpoint: default_guardian_endpoint(),
+            guardian_api_key: None,
+            query: default_news_query(),
+            poll_secs: default_news_poll_secs(),
+            lookback_minutes: default_news_lookback_minutes(),
+            max_articles: default_news_max_articles(),
+            max_bias_bps: default_news_max_bias_bps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     pub output_dir: String,
 }
@@ -200,4 +252,28 @@ fn default_max_total_exposure() -> f64 {
 
 fn default_max_orders_per_sec() -> usize {
     25
+}
+
+fn default_guardian_endpoint() -> String {
+    "https://content.guardianapis.com/search".to_string()
+}
+
+fn default_news_query() -> String {
+    "election OR inflation OR war OR sanctions OR fed OR economy OR earnings OR injury".to_string()
+}
+
+fn default_news_poll_secs() -> u64 {
+    30
+}
+
+fn default_news_lookback_minutes() -> i64 {
+    180
+}
+
+fn default_news_max_articles() -> usize {
+    25
+}
+
+fn default_news_max_bias_bps() -> f64 {
+    12.0
 }

@@ -51,6 +51,16 @@ inventory_skew_bps = 12.0
 quote_sizes = [1.0, 2.0, 3.0]
 refresh_interval_ms = 750
 
+[news]
+enabled = false
+guardian_endpoint = "https://content.guardianapis.com/search"
+guardian_api_key = ""
+query = "election OR inflation OR war OR sanctions OR fed OR economy OR earnings OR injury"
+poll_secs = 30
+lookback_minutes = 180
+max_articles = 25
+max_bias_bps = 12.0
+
 [logging]
 output_dir = "logs"
 

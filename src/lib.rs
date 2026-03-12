@@ -3,6 +3,7 @@ pub mod config;
 pub mod dashboard;
 pub mod execution;
 pub mod market_data;
+pub mod news;
 pub mod polymarket;
 pub mod risk;
 pub mod strategy;

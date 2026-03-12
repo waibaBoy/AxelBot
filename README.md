@@ -45,6 +45,8 @@ Risk-capped Rust market-making experiment scaffold for Polymarket-style predicti
    - `AXELBOT_API_KEY`
    - `AXELBOT_API_SECRET`
    - `AXELBOT_WALLET_PRIVATE_KEY`
+   - `AXELBOT_GUARDIAN_API_KEY`
+   - `AXELBOT_NEWS_ENABLED`
    - `AXELBOT_KILL_SWITCH`
 
 The CLI auto-loads a local `.env` file on startup (via `dotenvy`).

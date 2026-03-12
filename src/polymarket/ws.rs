@@ -36,6 +36,8 @@ pub struct PolymarketWsSource {
     >,
     connected: bool,
     unknown_frame_logs: u8,
+    log_full_unknown_frames: bool,
+    use_legacy_subscribe_payload: bool,
 }
 
 impl PolymarketWsSource {
@@ -58,6 +60,8 @@ impl PolymarketWsSource {
             writer: None,
             connected: false,
             unknown_frame_logs: 0,
+            log_full_unknown_frames: env_flag("AXELBOT_WS_LOG_FULL_UNKNOWN"),
+            use_legacy_subscribe_payload: env_flag("AXELBOT_WS_USE_LEGACY_SUB"),
         }
     }
 
@@ -72,14 +76,15 @@ impl PolymarketWsSource {
         self.reader = Some(reader);
         self.connected = true;
 
-        // Current CLOB market-channel subscription payload.
-        let market_sub = WsSubscription::market(self.token_ids.clone());
-        let msg = serde_json::to_string(&market_sub)?;
+        // Send exactly one subscription payload. Sending both modern+legacy can
+        // cause ambiguous server behavior in some deployments.
+        let sub = if self.use_legacy_subscribe_payload {
+            WsSubscription::market_legacy(self.token_ids.clone())
+        } else {
+            WsSubscription::market(self.token_ids.clone())
+        };
+        let msg = serde_json::to_string(&sub)?;
         self.send_raw(&msg).await?;
-        // Compatibility payload for deployments expecting `asset_ids`.
-        let legacy_sub = WsSubscription::market_legacy(self.token_ids.clone());
-        let legacy_msg = serde_json::to_string(&legacy_sub)?;
-        self.send_raw(&legacy_msg).await?;
 
         debug!(
             "subscribed to market channel for {} token IDs",
@@ -161,23 +166,47 @@ impl PolymarketWsSource {
     }
 
     fn parse_value_event(&mut self, v: &serde_json::Value, raw_text: &str) -> Option<MarketEvent> {
-        let event_type = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
-        match event_type {
+        let event_type = v
+            .get("event_type")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        match event_type.as_str() {
             "book" | "best_bid_ask" => self
                 .parse_book_event_value(&v)
                 .map(|evt| self.remap_market(evt)),
-            "trade" | "last_trade_price" | "price_change" => self
+            "trade" | "last_trade_price" => self
                 .parse_trade_event_value(&v)
                 .map(|evt| self.remap_market(evt)),
+            "price_change" => self
+                .parse_price_change_value(v)
+                .map(|evt| self.remap_market(evt)),
+            "tick_size_change" | "new_market" | "market_resolved" => None,
             _ => {
+                // Metadata frames sometimes arrive without event_type and do not
+                // carry tradable token updates.
+                if v.get("question").is_some()
+                    && v.get("slug").is_some()
+                    && v.get("market").is_some()
+                    && v.get("asset_id").is_none()
+                {
+                    return None;
+                }
                 if self.unknown_frame_logs < 5 {
                     self.unknown_frame_logs += 1;
-                    let snippet = if raw_text.len() > 300 {
+                    let snippet = if self.log_full_unknown_frames {
+                        raw_text.to_string()
+                    } else if raw_text.len() > 300 {
                         format!("{}...", &raw_text[..300])
                     } else {
                         raw_text.to_string()
                     };
-                    info!(snippet = %snippet, "ws_unknown_frame");
+                    info!(
+                        event_type = %event_type,
+                        payload_len = raw_text.len(),
+                        snippet = %snippet,
+                        "ws_unknown_frame"
+                    );
                 }
                 // Legacy channels occasionally omit event_type and provide shape-only payloads.
                 if v.get("bids").is_some()
@@ -228,8 +257,7 @@ impl PolymarketWsSource {
         let asset = v
             .get("asset_id")
             .or_else(|| v.get("assetId"))
-            .and_then(|x| x.as_str())?
-            .to_string();
+            .and_then(value_to_string)?;
         let bids = v
             .get("bids")
             .or_else(|| v.get("buys"))
@@ -300,8 +328,7 @@ impl PolymarketWsSource {
         let asset = v
             .get("asset_id")
             .or_else(|| v.get("assetId"))
-            .and_then(|x| x.as_str())?
-            .to_string();
+            .and_then(value_to_string)?;
         let price = v
             .get("price")
             .or_else(|| v.get("last_trade_price"))
@@ -331,6 +358,76 @@ impl PolymarketWsSource {
             side,
             timestamp: ts,
         })
+    }
+
+    fn parse_price_change_value(&self, v: &serde_json::Value) -> Option<MarketEvent> {
+        let changes = v.get("price_changes")?.as_array()?;
+        let ts = v
+            .get("timestamp")
+            .or_else(|| v.get("ts"))
+            .and_then(value_to_dt)
+            .unwrap_or_else(Utc::now);
+
+        for change in changes {
+            let asset = change.get("asset_id").and_then(value_to_string)?;
+            let best_bid = change
+                .get("best_bid")
+                .or_else(|| change.get("bestBid"))
+                .and_then(value_to_f64)
+                .unwrap_or(0.0);
+            let best_ask = change
+                .get("best_ask")
+                .or_else(|| change.get("bestAsk"))
+                .and_then(value_to_f64)
+                .unwrap_or(0.0);
+            if best_bid > 0.0 && best_ask > 0.0 && best_ask >= best_bid {
+                let level_size = change.get("size").and_then(value_to_f64).unwrap_or(1.0);
+                let side = change
+                    .get("side")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_default();
+                let (bid_size, ask_size) = if side == "BUY" {
+                    (level_size.max(0.0), 1.0)
+                } else if side == "SELL" {
+                    (1.0, level_size.max(0.0))
+                } else {
+                    (1.0, 1.0)
+                };
+                return Some(MarketEvent::BookUpdate {
+                    market: asset,
+                    bid: best_bid,
+                    bid_size,
+                    ask: best_ask,
+                    ask_size,
+                    timestamp: ts,
+                });
+            }
+
+            // Fallback: treat as trade-like update.
+            let price = change.get("price").and_then(value_to_f64)?;
+            let size = change.get("size").and_then(value_to_f64).unwrap_or(1.0);
+            let side = change
+                .get("side")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_ascii_uppercase())
+                .map(|s| {
+                    if s == "BUY" {
+                        crate::types::Side::Bid
+                    } else {
+                        crate::types::Side::Ask
+                    }
+                })
+                .unwrap_or(crate::types::Side::Bid);
+            return Some(MarketEvent::Trade {
+                market: asset,
+                price,
+                size,
+                side,
+                timestamp: ts,
+            });
+        }
+        None
     }
 
     fn remap_market(&self, event: MarketEvent) -> MarketEvent {
@@ -416,6 +513,19 @@ fn value_to_f64(v: &serde_json::Value) -> Option<f64> {
     v.as_str().and_then(|s| s.parse::<f64>().ok())
 }
 
+fn value_to_string(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
 fn value_to_dt(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     if let Some(n) = v.as_i64() {
         if n > 1_000_000_000_000 {
@@ -435,6 +545,13 @@ fn value_to_dt(v: &serde_json::Value) -> Option<DateTime<Utc>> {
         }
     }
     None
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 #[async_trait]

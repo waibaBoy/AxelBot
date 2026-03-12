@@ -20,6 +20,7 @@ pub struct QuoteProposal {
 pub struct MarketMakingStrategy {
     cfg: StrategyConfig,
     state: HashMap<String, StrategyState>,
+    news_bias_bps: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,11 +34,17 @@ impl MarketMakingStrategy {
         Self {
             cfg,
             state: HashMap::new(),
+            news_bias_bps: HashMap::new(),
         }
     }
 
     pub fn refresh_interval_ms(&self) -> i64 {
         self.cfg.refresh_interval_ms
+    }
+
+    pub fn set_news_bias_bps(&mut self, market: &str, bias_bps: f64) {
+        self.news_bias_bps
+            .insert(market.to_string(), bias_bps.clamp(-100.0, 100.0));
     }
 
     pub fn generate_quote(&mut self, snapshot: &MarketSnapshot, inventory: f64) -> QuoteProposal {
@@ -60,7 +67,14 @@ impl MarketMakingStrategy {
             * snapshot.fair_value
             * snapshot.imbalance
             * 0.5;
-        let centered_fair = snapshot.fair_value - inv_skew - depth_skew;
+        let news_shift = self
+            .news_bias_bps
+            .get(&snapshot.market)
+            .copied()
+            .unwrap_or(0.0)
+            / 10_000.0
+            * snapshot.fair_value;
+        let centered_fair = snapshot.fair_value - inv_skew - depth_skew + news_shift;
 
         let mut bid = centered_fair - spread * 0.5;
         let mut ask = centered_fair + spread * 0.5;

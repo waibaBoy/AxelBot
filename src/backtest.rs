@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -21,6 +21,7 @@ use crate::{
         SimulatedExchangeClient,
     },
     market_data::{MarketDataCache, MarketDataSource, SimulatedMarketDataSource},
+    news::NewsOverlay,
     polymarket::{
         client::{PolymarketClient, PolymarketPublicClient},
         replay::HistoricalReplaySource,
@@ -187,6 +188,7 @@ pub async fn run_backtest_history(
         source,
         config.bankroll.starting_cash,
         vec![market.to_string()],
+        HashMap::from([(market.to_string(), market.to_string())]),
     )
     .await?;
 
@@ -262,6 +264,24 @@ pub async fn run_paper_live_data(
         std::collections::HashMap::new();
     let mut all_token_ids: Vec<String> = Vec::new();
     let mut market_symbols: Vec<String> = Vec::new();
+    let mut token_to_text: HashMap<String, String> = HashMap::new();
+    let active_markets = public
+        .get_all_active_markets(desired_markets * 25)
+        .await
+        .unwrap_or_default();
+    for m in &active_markets {
+        let descriptor = format!(
+            "{} {} {}",
+            m.question,
+            m.description.clone().unwrap_or_default(),
+            m.market_slug.clone().unwrap_or_default()
+        );
+        for tok in &m.tokens {
+            if !tok.token_id.trim().is_empty() {
+                token_to_text.insert(tok.token_id.clone(), descriptor.clone());
+            }
+        }
+    }
 
     // First choice: use recently traded tokens, which are much more likely to
     // emit WS events immediately.
@@ -283,8 +303,11 @@ pub async fn run_paper_live_data(
 
     // Fallback: derive tokens from active market metadata.
     if market_symbols.len() < 2 {
-        let target_active = desired_markets * 20;
-        let clob_markets = public.get_all_active_markets(target_active).await?;
+        let clob_markets = if active_markets.is_empty() {
+            public.get_all_active_markets(desired_markets * 20).await?
+        } else {
+            active_markets.clone()
+        };
         for m in &clob_markets {
             for tok in &m.tokens {
                 let token = tok.token_id.trim().to_string();
@@ -350,6 +373,15 @@ pub async fn run_paper_live_data(
     };
     let rest_source = RestPollingSource::new(&config.exchange.rest_url, all_token_ids);
     let source = HybridLiveSource::new(ws_source, rest_source, ws_enabled);
+    let market_texts = market_symbols
+        .iter()
+        .map(|m| {
+            (
+                m.clone(),
+                token_to_text.get(m).cloned().unwrap_or_else(|| m.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let report = run_core_loop_with_source(
         config,
@@ -360,6 +392,7 @@ pub async fn run_paper_live_data(
         source,
         config.bankroll.starting_cash,
         market_symbols,
+        market_texts,
     )
     .await?;
 
@@ -712,6 +745,10 @@ struct HybridLiveSource {
     ws: PolymarketWsSource,
     rest: RestPollingSource,
     ws_enabled: bool,
+    ws_probe_timeout_ms: u64,
+    ws_reconnect_at: Instant,
+    ws_quiet_count: u32,
+    ws_quiet_disable_after: u32,
 }
 
 impl HybridLiveSource {
@@ -720,6 +757,10 @@ impl HybridLiveSource {
             ws,
             rest,
             ws_enabled,
+            ws_probe_timeout_ms: 600,
+            ws_reconnect_at: Instant::now(),
+            ws_quiet_count: 0,
+            ws_quiet_disable_after: 20,
         }
     }
 }
@@ -727,19 +768,47 @@ impl HybridLiveSource {
 #[async_trait]
 impl MarketDataSource for HybridLiveSource {
     async fn next_event(&mut self) -> Result<crate::market_data::MarketEvent> {
+        if !self.ws_enabled && Instant::now() >= self.ws_reconnect_at {
+            self.ws_enabled = true;
+        }
+
         if self.ws_enabled {
-            match timeout(StdDuration::from_millis(60_000), self.ws.next_event()).await {
-                Ok(Ok(event)) => return Ok(event),
+            // Probe WS briefly; if quiet, use REST for this tick without disabling WS.
+            match timeout(
+                StdDuration::from_millis(self.ws_probe_timeout_ms),
+                self.ws.next_event(),
+            )
+            .await
+            {
+                Ok(Ok(event)) => {
+                    self.ws_quiet_count = 0;
+                    return Ok(event);
+                }
                 Ok(Err(err)) => {
                     warn!(
                         "ws market data stream failed, falling back to REST polling: {}",
                         err
                     );
                     self.ws_enabled = false;
+                    self.ws_reconnect_at = Instant::now() + StdDuration::from_secs(5);
                 }
                 Err(_) => {
-                    warn!("ws market data stream timed out (60s), falling back to REST polling");
-                    self.ws_enabled = false;
+                    self.ws_quiet_count = self.ws_quiet_count.saturating_add(1);
+                    if self.ws_quiet_count >= self.ws_quiet_disable_after {
+                        warn!(
+                            "ws market data stream quiet ({} probes), pausing WS and using REST",
+                            self.ws_quiet_count
+                        );
+                        self.ws_enabled = false;
+                        self.ws_reconnect_at = Instant::now() + StdDuration::from_secs(5);
+                        self.ws_quiet_count = 0;
+                    }
+                    if self.ws_quiet_count % 50 == 0 {
+                        warn!(
+                            "ws market data stream quiet ({} probes), using REST gap-fill",
+                            self.ws_quiet_count
+                        );
+                    }
                 }
             }
         }
@@ -777,6 +846,12 @@ async fn run_core_loop(
         source,
         config.bankroll.starting_cash,
         config.markets.symbols.clone(),
+        config
+            .markets
+            .symbols
+            .iter()
+            .map(|m| (m.clone(), m.clone()))
+            .collect::<HashMap<_, _>>(),
     )
     .await
 }
@@ -790,9 +865,13 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
     mut source: S,
     starting_cash: f64,
     markets: Vec<String>,
+    market_texts: HashMap<String, String>,
 ) -> Result<CoreLoopReport> {
     let mut cache = MarketDataCache::new(&markets);
     let mut strategy = MarketMakingStrategy::new(config.strategy.clone());
+    let news_overlay = NewsOverlay::new(config.news.clone());
+    let mut news_bias_by_market: HashMap<String, f64> = HashMap::new();
+    let mut next_news_refresh_at = Utc::now();
     let risk = RiskEngine::new(config.risk.clone(), starting_cash);
     let client = SimulatedExchangeClient::new(config.execution.fill_fee_bps);
     let mut engine =
@@ -819,6 +898,11 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
                 "target_spread_bps": config.strategy.target_spread_bps,
                 "inventory_skew_bps": config.strategy.inventory_skew_bps,
                 "quote_sizes": &config.strategy.quote_sizes,
+            },
+            "news": {
+                "enabled": config.news.enabled,
+                "provider": "guardian",
+                "poll_secs": config.news.poll_secs,
             }
         }),
     )?;
@@ -880,6 +964,33 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
                 .entry(snapshot.market.clone())
                 .or_insert(snapshot.timestamp);
             if snapshot.timestamp >= *due {
+                if news_overlay.is_enabled() && Utc::now() >= next_news_refresh_at {
+                    match news_overlay.refresh_market_biases(&market_texts).await {
+                        Ok(new_biases) => {
+                            news_bias_by_market = new_biases;
+                            logger.log_event(
+                                "news_bias_refresh",
+                                &serde_json::json!({
+                                    "markets_with_bias": news_bias_by_market.len(),
+                                    "sample": news_bias_by_market.iter().take(3).collect::<Vec<_>>(),
+                                }),
+                            )?;
+                        }
+                        Err(err) => {
+                            logger.log_event(
+                                "news_bias_refresh_error",
+                                &serde_json::json!({ "error": err.to_string() }),
+                            )?;
+                        }
+                    }
+                    next_news_refresh_at =
+                        Utc::now() + Duration::seconds(config.news.poll_secs as i64);
+                }
+                let news_bps = news_bias_by_market
+                    .get(&snapshot.market)
+                    .copied()
+                    .unwrap_or(0.0);
+                strategy.set_news_bias_bps(&snapshot.market, news_bps);
                 let quote = strategy.generate_quote(&snapshot, inventory);
                 engine
                     .process_quote(quote, snapshot.timestamp, logger)
