@@ -6,6 +6,7 @@ use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::Sha256;
 
+use super::http::build_http_client;
 use super::signer::{OrderParams, PolymarketSigner};
 use super::types::{
     ClobFeeRate, ClobMarket, ClobOpenOrder, ClobOrderRequest, ClobOrderResponse, ClobOrderType,
@@ -34,18 +35,39 @@ pub struct PolymarketClient {
     wallet_address: String,
     /// Fee rate in basis points applied to orders
     fee_rate_bps: u64,
+    proxy_url: Option<String>,
 }
 
 /// Public/read-only Polymarket CLOB client for market data and metadata endpoints.
+#[derive(Clone)]
 pub struct PolymarketPublicClient {
     http: reqwest::Client,
     rest_url: String,
 }
 
+fn resilient_http_client(proxy_url: Option<&str>) -> reqwest::Client {
+    match build_http_client(proxy_url) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to build HTTP client with proxy ({:?}): {}. falling back to direct client",
+                proxy_url, err
+            );
+            // Keep fallback deterministic: don't auto-read ambient *_PROXY env vars.
+            build_http_client(None).unwrap_or_else(|_| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            })
+        }
+    }
+}
+
 impl PolymarketPublicClient {
-    pub fn new(rest_url: impl Into<String>) -> Self {
+    pub fn new(rest_url: impl Into<String>, proxy_url: Option<&str>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: resilient_http_client(proxy_url),
             rest_url: rest_url.into(),
         }
     }
@@ -400,9 +422,10 @@ impl PolymarketClient {
         passphrase: impl Into<String>,
         signer: PolymarketSigner,
         wallet_address: impl Into<String>,
+        proxy_url: Option<&str>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: resilient_http_client(proxy_url),
             rest_url: rest_url.into(),
             api_key: api_key.into(),
             api_secret: api_secret.into(),
@@ -410,6 +433,7 @@ impl PolymarketClient {
             signer,
             wallet_address: wallet_address.into(),
             fee_rate_bps: 0,
+            proxy_url: proxy_url.map(|s| s.to_string()),
         }
     }
 
@@ -564,35 +588,35 @@ impl PolymarketClient {
 
     /// Fetch CLOB server time in epoch milliseconds.
     pub async fn get_server_time(&self) -> Result<ClobServerTime> {
-        PolymarketPublicClient::new(self.rest_url.clone())
+        PolymarketPublicClient::new(self.rest_url.clone(), self.proxy_url.as_deref())
             .get_server_time()
             .await
     }
 
     /// Fetch current default fee rate in basis points.
     pub async fn get_fee_rate(&self) -> Result<ClobFeeRate> {
-        PolymarketPublicClient::new(self.rest_url.clone())
+        PolymarketPublicClient::new(self.rest_url.clone(), self.proxy_url.as_deref())
             .get_fee_rate()
             .await
     }
 
     /// Fetch fee rate for a specific token.
     pub async fn get_fee_rate_for_token(&self, token_id: &str) -> Result<ClobFeeRate> {
-        PolymarketPublicClient::new(self.rest_url.clone())
+        PolymarketPublicClient::new(self.rest_url.clone(), self.proxy_url.as_deref())
             .get_fee_rate_for_token(token_id)
             .await
     }
 
     /// Fetch default tick size.
     pub async fn get_tick_size(&self) -> Result<ClobTickSize> {
-        PolymarketPublicClient::new(self.rest_url.clone())
+        PolymarketPublicClient::new(self.rest_url.clone(), self.proxy_url.as_deref())
             .get_tick_size()
             .await
     }
 
     /// Fetch tick size for a specific token.
     pub async fn get_tick_size_for_token(&self, token_id: &str) -> Result<ClobTickSize> {
-        PolymarketPublicClient::new(self.rest_url.clone())
+        PolymarketPublicClient::new(self.rest_url.clone(), self.proxy_url.as_deref())
             .get_tick_size_for_token(token_id)
             .await
     }
@@ -605,7 +629,7 @@ impl PolymarketClient {
         end: DateTime<Utc>,
         fidelity: &str,
     ) -> Result<Vec<PriceHistoryPoint>> {
-        PolymarketPublicClient::new(self.rest_url.clone())
+        PolymarketPublicClient::new(self.rest_url.clone(), self.proxy_url.as_deref())
             .get_prices_history(token_id, start, end, fidelity)
             .await
     }

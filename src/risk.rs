@@ -100,6 +100,10 @@ impl RiskEngine {
         &self.halted_markets
     }
 
+    pub fn max_per_market_exposure(&self) -> f64 {
+        self.cfg.max_per_market_exposure
+    }
+
     pub fn emergency_stop(&mut self, reason: impl Into<String>) {
         self.halted = true;
         self.halt_reason = Some(reason.into());
@@ -110,6 +114,7 @@ impl RiskEngine {
         req: &OrderRequest,
         now: DateTime<Utc>,
         inventory_by_market: &HashMap<String, f64>,
+        open_orders_by_market: &HashMap<String, (f64, f64)>, // (total bid remaining, total ask remaining)
         open_order_count: usize,
     ) -> RiskDecision {
         if self.halted {
@@ -144,29 +149,40 @@ impl RiskEngine {
             });
         }
         let current_inventory = inventory_by_market.get(&req.market).copied().unwrap_or(0.0);
-        let projected_inventory = current_inventory + req.side.sign() * req.size;
-        if projected_inventory.abs() > self.cfg.max_per_market_exposure {
+        let (open_bids, open_asks) = open_orders_by_market.get(&req.market).copied().unwrap_or((0.0, 0.0));
+        let future_bids = open_bids + if req.side == Side::Bid { req.size } else { 0.0 };
+        let future_asks = open_asks + if req.side == Side::Ask { req.size } else { 0.0 };
+        let max_long = current_inventory + future_bids;
+        let max_short = current_inventory - future_asks;
+        let worst_abs = f64::max(max_long.abs(), max_short.abs());
+        let projected_inventory = if max_long.abs() > max_short.abs() { max_long } else { max_short };
+
+        if worst_abs > self.cfg.max_per_market_exposure {
             return RiskDecision::reject(RiskRejectReason::ExposureLimit {
                 market: req.market.clone(),
                 projected: projected_inventory,
                 limit: self.cfg.max_per_market_exposure,
             });
         }
-        let projected_total = inventory_by_market
-            .iter()
-            .map(|(m, q)| {
-                if m == &req.market {
-                    projected_inventory.abs()
-                } else {
-                    q.abs()
-                }
-            })
-            .sum::<f64>()
-            + if inventory_by_market.contains_key(&req.market) {
-                0.0
-            } else {
-                projected_inventory.abs()
-            };
+
+        let mut projected_total = 0.0;
+        let mut all_markets = std::collections::HashSet::new();
+        for m in inventory_by_market.keys() { all_markets.insert(m); }
+        for m in open_orders_by_market.keys() { all_markets.insert(m); }
+        all_markets.insert(&req.market);
+
+        for m in all_markets {
+            let m_inv = inventory_by_market.get(m).copied().unwrap_or(0.0);
+            let (m_bids, m_asks) = open_orders_by_market.get(m).copied().unwrap_or((0.0, 0.0));
+            
+            let m_future_bids = m_bids + if m == &req.market && req.side == Side::Bid { req.size } else { 0.0 };
+            let m_future_asks = m_asks + if m == &req.market && req.side == Side::Ask { req.size } else { 0.0 };
+            
+            let m_max_long = m_inv + m_future_bids;
+            let m_max_short = m_inv - m_future_asks;
+            projected_total += f64::max(m_max_long.abs(), m_max_short.abs());
+        }
+
         if projected_total > self.cfg.max_total_exposure {
             return RiskDecision::reject(RiskRejectReason::GlobalExposureLimit {
                 projected_total,
@@ -205,6 +221,9 @@ impl RiskEngine {
     }
 
     pub fn on_fill(&mut self, fill: &FillEvent) {
+        if fill.expected_price <= 0.0 || !fill.expected_price.is_finite() || !fill.price.is_finite() {
+            return;
+        }
         let slippage_bps = match fill.side {
             Side::Bid => ((fill.price - fill.expected_price) / fill.expected_price) * 10_000.0,
             Side::Ask => ((fill.expected_price - fill.price) / fill.expected_price) * 10_000.0,
@@ -286,7 +305,7 @@ mod tests {
         };
         let mut inv = HashMap::new();
         inv.insert("M1".to_string(), 20.0);
-        let decision = risk.check_pre_trade(&req, now, &inv, 0);
+        let decision = risk.check_pre_trade(&req, now, &inv, &HashMap::new(), 0);
         assert!(!decision.allowed);
         assert!(matches!(
             decision.reason,
@@ -306,7 +325,7 @@ mod tests {
             size: 1.0,
             quote_ts: now,
         };
-        let decision = risk.check_pre_trade(&req, now, &HashMap::new(), 4);
+        let decision = risk.check_pre_trade(&req, now, &HashMap::new(), &HashMap::new(), 4);
         assert!(!decision.allowed);
         assert!(matches!(
             decision.reason,
@@ -329,7 +348,7 @@ mod tests {
             quote_ts: now,
         };
         let inv = HashMap::from([("M1".to_string(), 10.0), ("M2".to_string(), 8.0)]);
-        let decision = risk.check_pre_trade(&req, now, &inv, 0);
+        let decision = risk.check_pre_trade(&req, now, &inv, &HashMap::new(), 0);
         assert!(!decision.allowed);
         assert!(matches!(
             decision.reason,

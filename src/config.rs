@@ -37,6 +37,7 @@ impl AppConfig {
         Self::empty_to_none(&mut self.exchange.api_secret);
         Self::empty_to_none(&mut self.exchange.wallet_private_key);
         Self::empty_to_none(&mut self.news.guardian_api_key);
+        Self::normalize_proxy_url(&mut self.exchange.proxy_url);
 
         if self.markets.symbols.len() < self.markets.min_markets {
             let mut idx = self.markets.symbols.len();
@@ -57,6 +58,26 @@ impl AppConfig {
         {
             *slot = None;
         }
+    }
+
+    fn normalize_proxy_url(slot: &mut Option<String>) {
+        let normalized = slot.as_deref().map(str::trim).and_then(|raw| {
+            if raw.is_empty() {
+                return None;
+            }
+            let unquoted = raw
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(raw)
+                .trim();
+            if unquoted.is_empty() {
+                None
+            } else {
+                Some(unquoted.to_string())
+            }
+        });
+        *slot = normalized;
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -88,6 +109,44 @@ impl AppConfig {
         if self.strategy.quote_sizes.is_empty() {
             return Err(anyhow!("strategy.quote_sizes cannot be empty"));
         }
+        if !(0.0..=1.0).contains(&self.execution.inventory_soft_limit_ratio) {
+            return Err(anyhow!(
+                "execution.inventory_soft_limit_ratio must be in [0, 1]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.execution.inventory_hard_limit_ratio) {
+            return Err(anyhow!(
+                "execution.inventory_hard_limit_ratio must be in [0, 1]"
+            ));
+        }
+        if self.execution.inventory_hard_limit_ratio < self.execution.inventory_soft_limit_ratio {
+            return Err(anyhow!(
+                "execution.inventory_hard_limit_ratio must be >= execution.inventory_soft_limit_ratio"
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.execution.inventory_min_size_scale)
+            || self.execution.inventory_min_size_scale <= 0.0
+        {
+            return Err(anyhow!(
+                "execution.inventory_min_size_scale must be in (0, 1]"
+            ));
+        }
+        if self.execution.inventory_flatten_boost < 1.0 {
+            return Err(anyhow!(
+                "execution.inventory_flatten_boost must be >= 1.0"
+            ));
+        }
+        if self.execution.sim_fill_min_latency_ms < 0 {
+            return Err(anyhow!("execution.sim_fill_min_latency_ms must be >= 0"));
+        }
+        if self.execution.sim_fill_max_latency_ms < self.execution.sim_fill_min_latency_ms {
+            return Err(anyhow!(
+                "execution.sim_fill_max_latency_ms must be >= execution.sim_fill_min_latency_ms"
+            ));
+        }
+        if self.execution.sim_slippage_bps < 0.0 {
+            return Err(anyhow!("execution.sim_slippage_bps must be non-negative"));
+        }
         if self.news.poll_secs == 0 {
             return Err(anyhow!("news.poll_secs must be >= 1"));
         }
@@ -116,6 +175,11 @@ impl AppConfig {
         if let Ok(v) = env::var("AXELBOT_KILL_SWITCH") {
             self.risk.kill_switch = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
         }
+        if let Ok(v) = env::var("AXELBOT_PROXY_URL") {
+            if !v.trim().is_empty() {
+                self.exchange.proxy_url = Some(v);
+            }
+        }
         if let Ok(v) = env::var("AXELBOT_NEWS_ENABLED") {
             self.news.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
         }
@@ -134,6 +198,8 @@ pub struct ExchangeConfig {
     pub api_secret: Option<String>,
     pub wallet_address: String,
     pub wallet_private_key: Option<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +208,12 @@ pub struct MarketUniverseConfig {
     pub min_markets: usize,
     pub refresh_secs: u64,
     pub selection_mode: String,
+    #[serde(default = "default_book_probe_timeout_ms")]
+    pub book_probe_timeout_ms: u64,
+    #[serde(default = "default_rest_poll_timeout_ms")]
+    pub rest_poll_timeout_ms: u64,
+    #[serde(default = "default_data_event_timeout_ms")]
+    pub data_event_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,12 +233,46 @@ pub struct RiskConfig {
     pub max_slippage_bps: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnrecognizedFillPolicy {
+    Apply,
+    Quarantine,
+    Drop,
+}
+
+impl Default for UnrecognizedFillPolicy {
+    fn default() -> Self {
+        Self::Quarantine
+    }
+}
+
+fn default_unrecognized_fill_policy() -> UnrecognizedFillPolicy {
+    UnrecognizedFillPolicy::default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConfig {
+    #[serde(default = "default_unrecognized_fill_policy")]
+    pub unrecognized_fill_policy: UnrecognizedFillPolicy,
     pub post_only: bool,
     pub order_ttl_ms: i64,
     pub max_retries: usize,
     pub fill_fee_bps: f64,
+    #[serde(default = "default_inventory_soft_limit_ratio")]
+    pub inventory_soft_limit_ratio: f64,
+    #[serde(default = "default_inventory_hard_limit_ratio")]
+    pub inventory_hard_limit_ratio: f64,
+    #[serde(default = "default_inventory_min_size_scale")]
+    pub inventory_min_size_scale: f64,
+    #[serde(default = "default_inventory_flatten_boost")]
+    pub inventory_flatten_boost: f64,
+    #[serde(default = "default_sim_fill_min_latency_ms")]
+    pub sim_fill_min_latency_ms: i64,
+    #[serde(default = "default_sim_fill_max_latency_ms")]
+    pub sim_fill_max_latency_ms: i64,
+    #[serde(default = "default_sim_slippage_bps")]
+    pub sim_slippage_bps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +364,34 @@ fn default_guardian_endpoint() -> String {
     "https://content.guardianapis.com/search".to_string()
 }
 
+fn default_inventory_soft_limit_ratio() -> f64 {
+    0.60
+}
+
+fn default_inventory_hard_limit_ratio() -> f64 {
+    0.90
+}
+
+fn default_inventory_min_size_scale() -> f64 {
+    0.15
+}
+
+fn default_inventory_flatten_boost() -> f64 {
+    1.75
+}
+
+fn default_sim_fill_min_latency_ms() -> i64 {
+    80
+}
+
+fn default_sim_fill_max_latency_ms() -> i64 {
+    350
+}
+
+fn default_sim_slippage_bps() -> f64 {
+    1.5
+}
+
 fn default_news_query() -> String {
     "election OR inflation OR war OR sanctions OR fed OR economy OR earnings OR injury".to_string()
 }
@@ -276,4 +410,16 @@ fn default_news_max_articles() -> usize {
 
 fn default_news_max_bias_bps() -> f64 {
     12.0
+}
+
+fn default_book_probe_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_rest_poll_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_data_event_timeout_ms() -> u64 {
+    30_000
 }

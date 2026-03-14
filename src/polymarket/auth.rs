@@ -6,6 +6,8 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 
+use super::http::build_http_client;
+
 const EIP712_DOMAIN_TYPEHASH: &[u8] = b"EIP712Domain(string name,string version,uint256 chainId)";
 const CLOB_AUTH_TYPEHASH: &[u8] =
     b"ClobAuth(address address,string timestamp,uint256 nonce,string message)";
@@ -48,22 +50,23 @@ pub async fn get_api_credentials(
     chain_id: u64,
     nonce: u64,
     mode: ApiCredsMode,
+    proxy_url: Option<&str>,
 ) -> Result<(String, ApiCredentials)> {
     let signer = parse_signer(private_key)?;
     let address = format!("{:?}", signer.address());
-    let ts = get_server_timestamp_secs(rest_url).await?;
+    let ts = get_server_timestamp_secs(rest_url, proxy_url).await?;
     let signature = sign_l1_auth(&signer, chain_id, &address, &ts, nonce)?;
     let headers = build_l1_headers(&address, &signature, &ts, nonce)?;
 
     let creds = match mode {
         ApiCredsMode::Create => {
-            request_api_credentials(rest_url, Method::POST, "/auth/api-key", headers).await?
+            request_api_credentials(rest_url, Method::POST, "/auth/api-key", headers, proxy_url).await?
         }
         ApiCredsMode::Derive => {
-            request_api_credentials(rest_url, Method::GET, "/auth/derive-api-key", headers).await?
+            request_api_credentials(rest_url, Method::GET, "/auth/derive-api-key", headers, proxy_url).await?
         }
         ApiCredsMode::CreateOrDerive => {
-            match request_api_credentials(rest_url, Method::POST, "/auth/api-key", headers.clone())
+            match request_api_credentials(rest_url, Method::POST, "/auth/api-key", headers.clone(), proxy_url)
                 .await
             {
                 Ok(c) => c,
@@ -72,7 +75,7 @@ pub async fn get_api_credentials(
                         || err.status == StatusCode::BAD_REQUEST
                         || err.body.to_ascii_uppercase().contains("NONCE_ALREADY_USED") =>
                 {
-                    request_api_credentials(rest_url, Method::GET, "/auth/derive-api-key", headers)
+                    request_api_credentials(rest_url, Method::GET, "/auth/derive-api-key", headers, proxy_url)
                         .await?
                 }
                 Err(err) => return Err(anyhow!("failed to create API key: {err}")),
@@ -104,10 +107,10 @@ fn parse_signer(private_key: &str) -> Result<PrivateKeySigner> {
         .context("failed to parse wallet private key")
 }
 
-async fn get_server_timestamp_secs(rest_url: &str) -> Result<String> {
+async fn get_server_timestamp_secs(rest_url: &str, proxy_url: Option<&str>) -> Result<String> {
     let rest_url = rest_url.trim_end_matches('/');
     let url = format!("{rest_url}/time");
-    let resp = reqwest::Client::new()
+    let resp = build_http_client(proxy_url)?
         .get(url)
         .send()
         .await
@@ -190,10 +193,14 @@ async fn request_api_credentials(
     method: Method,
     path: &str,
     headers: HeaderMap,
+    proxy_url: Option<&str>,
 ) -> std::result::Result<ApiCredentials, ApiError> {
     let rest_url = rest_url.trim_end_matches('/');
     let url = format!("{rest_url}{path}");
-    let client = reqwest::Client::new();
+    let client = build_http_client(proxy_url).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        body: format!("failed to build HTTP client: {e}"),
+    })?;
 
     let req = client.request(method, &url).headers(headers);
     let resp = req.send().await.map_err(|e| ApiError {

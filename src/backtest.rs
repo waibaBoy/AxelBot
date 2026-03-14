@@ -20,7 +20,9 @@ use crate::{
         ExecutionEngine, HttpWsExchangeClient, JsonlLogger, MetricsSnapshot,
         SimulatedExchangeClient,
     },
-    market_data::{MarketDataCache, MarketDataSource, SimulatedMarketDataSource},
+    market_data::{
+        MarketDataCache, MarketDataSource, SimulatedMarketDataSource, MAX_VALID_BOOK_SPREAD,
+    },
     news::NewsOverlay,
     polymarket::{
         client::{PolymarketClient, PolymarketPublicClient},
@@ -137,7 +139,8 @@ pub async fn run_backtest_history(
     }
     let mode = "backtest-history";
     let mut logger = JsonlLogger::new(&config.logging.output_dir, mode)?;
-    let public = PolymarketPublicClient::new(&config.exchange.rest_url);
+    let proxy = config.exchange.proxy_url.as_deref();
+    let public = PolymarketPublicClient::new(&config.exchange.rest_url, proxy);
     let server_time = public.get_server_time().await?;
     let fee_rate = match public.get_fee_rate_for_token(market).await {
         Ok(v) => v,
@@ -256,14 +259,16 @@ pub async fn run_paper_live_data(
 ) -> Result<SessionReport> {
     let mode = "paper-live";
     let mut logger = JsonlLogger::new(&config.logging.output_dir, mode)?;
+    let proxy = config.exchange.proxy_url.as_deref();
 
-    let public = PolymarketPublicClient::new(&config.exchange.rest_url);
+    let public = PolymarketPublicClient::new(&config.exchange.rest_url, proxy);
     let desired_markets = config.markets.min_markets.max(2);
 
     let mut token_to_market: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut all_token_ids: Vec<String> = Vec::new();
     let mut market_symbols: Vec<String> = Vec::new();
+    let mut candidate_tokens: Vec<String> = Vec::new();
     let mut token_to_text: HashMap<String, String> = HashMap::new();
     let active_markets = public
         .get_all_active_markets(desired_markets * 25)
@@ -290,7 +295,64 @@ pub async fn run_paper_live_data(
         .await
         .unwrap_or_default();
     for token in recent_tokens {
-        if token.is_empty() || market_symbols.contains(&token) {
+        if token.is_empty() || candidate_tokens.contains(&token) {
+            continue;
+        }
+        candidate_tokens.push(token);
+        if candidate_tokens.len() >= desired_markets * 8 {
+            break;
+        }
+    }
+
+    // Fallback candidate pool: derive additional tokens from active market metadata.
+    let clob_markets = if active_markets.is_empty() {
+        public.get_all_active_markets(desired_markets * 20).await?
+    } else {
+        active_markets.clone()
+    };
+    for m in &clob_markets {
+        for tok in &m.tokens {
+            let token = tok.token_id.trim().to_string();
+            if token.is_empty() || candidate_tokens.contains(&token) {
+                continue;
+            }
+            candidate_tokens.push(token);
+            if candidate_tokens.len() >= desired_markets * 25 {
+                break;
+            }
+        }
+        if candidate_tokens.len() >= desired_markets * 25 {
+            break;
+        }
+    }
+
+    // Validate candidates up-front so we only subscribe/poll tradable orderbooks.
+    let candidate_backup = candidate_tokens.clone();
+    let mut scanned = 0usize;
+    let mut fetch_failures = 0usize;
+    let mut invalid_books = 0usize;
+    for token in candidate_tokens {
+        scanned += 1;
+        let book = match timeout(
+            StdDuration::from_millis(config.markets.book_probe_timeout_ms),
+            public.get_orderbook(&token),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            _ => {
+                fetch_failures = fetch_failures.saturating_add(1);
+                continue;
+            }
+        };
+        let best_bid = book.bids.first().map(|l| l.price_f64()).unwrap_or(0.0);
+        let best_ask = book.asks.first().map(|l| l.price_f64()).unwrap_or(0.0);
+        if !(best_bid > 0.0
+            && best_ask > 0.0
+            && best_ask > best_bid
+            && (best_ask - best_bid) <= MAX_VALID_BOOK_SPREAD)
+        {
+            invalid_books = invalid_books.saturating_add(1);
             continue;
         }
         token_to_market.insert(token.clone(), token.clone());
@@ -300,37 +362,62 @@ pub async fn run_paper_live_data(
             break;
         }
     }
+    logger.log_event(
+        "paper_live_candidate_scan",
+        &serde_json::json!({
+            "candidates": scanned,
+            "tradable": market_symbols.len(),
+            "fetch_failures": fetch_failures,
+            "invalid_books": invalid_books,
+            "max_valid_spread": MAX_VALID_BOOK_SPREAD,
+        }),
+    )?;
 
-    // Fallback: derive tokens from active market metadata.
     if market_symbols.len() < 2 {
-        let clob_markets = if active_markets.is_empty() {
-            public.get_all_active_markets(desired_markets * 20).await?
-        } else {
-            active_markets.clone()
-        };
-        for m in &clob_markets {
-            for tok in &m.tokens {
-                let token = tok.token_id.trim().to_string();
-                if token.is_empty() || market_symbols.contains(&token) {
+        // Degraded mode: when no tradable markets pass strict validation,
+        // fall back to best-effort WS candidates. This covers both flaky
+        // REST connectivity (high fetch_failures) and markets with wide
+        // spreads that fail book validation (high invalid_books).
+        let unusable = fetch_failures.saturating_add(invalid_books);
+        if scanned > 0
+            && unusable.saturating_mul(5) >= scanned.saturating_mul(4)
+            && candidate_backup.len() >= 2
+        {
+            for token in candidate_backup.into_iter() {
+                if market_symbols.contains(&token) {
                     continue;
                 }
                 token_to_market.insert(token.clone(), token.clone());
                 all_token_ids.push(token.clone());
                 market_symbols.push(token);
-                if market_symbols.len() >= desired_markets {
+                if market_symbols.len() >= desired_markets.max(2) {
                     break;
                 }
             }
-            if market_symbols.len() >= desired_markets {
-                break;
-            }
+            logger.log_event(
+                "paper_live_candidate_fallback",
+                &serde_json::json!({
+                    "reason": "rest_validation_no_tradable",
+                    "selected_markets": market_symbols.len(),
+                    "fetch_failures": fetch_failures,
+                    "invalid_books": invalid_books,
+                    "scanned": scanned,
+                }),
+            )?;
         }
     }
 
     if market_symbols.len() < 2 {
+        if scanned > 0 && fetch_failures >= scanned {
+            return Err(anyhow!(
+                "insufficient tradable markets discovered after validation (found {}, need at least 2); likely CLOB connectivity issue: all {} orderbook probes failed",
+                market_symbols.len(),
+                scanned
+            ));
+        }
         return Err(anyhow!(
-            "insufficient tradable markets discovered (found {}, need at least 2)",
-            market_symbols.len(),
+            "insufficient tradable markets discovered after validation (found {}, need at least 2)",
+            market_symbols.len()
         ));
     }
 
@@ -357,6 +444,7 @@ pub async fn run_paper_live_data(
         &config.exchange.ws_url,
         all_token_ids.clone(),
         token_to_market,
+        proxy,
     );
     let ws_enabled = match ws_source.connect().await {
         Ok(_) => true,
@@ -371,7 +459,7 @@ pub async fn run_paper_live_data(
             false
         }
     };
-    let rest_source = RestPollingSource::new(&config.exchange.rest_url, all_token_ids);
+    let rest_source = RestPollingSource::new(&config.exchange.rest_url, all_token_ids, proxy, config.markets.rest_poll_timeout_ms);
     let source = HybridLiveSource::new(ws_source, rest_source, ws_enabled);
     let market_texts = market_symbols
         .iter()
@@ -442,6 +530,7 @@ pub async fn run_live(
     }
 
     // ---- Live mode with real Polymarket connection ----
+    let proxy = config.exchange.proxy_url.as_deref();
     let api_key = config.exchange.api_key.clone().unwrap();
     let api_secret = config.exchange.api_secret.clone().unwrap();
     let private_key = config.exchange.wallet_private_key.clone().unwrap();
@@ -465,6 +554,7 @@ pub async fn run_live(
         &passphrase,
         signer,
         &wallet_address,
+        proxy,
     );
 
     // Discover markets
@@ -534,6 +624,7 @@ pub async fn run_live(
         &config.exchange.ws_url,
         all_token_ids.clone(),
         token_to_market,
+        proxy,
     );
     let ws_enabled = match ws_source.connect().await {
         Ok(_) => true,
@@ -548,11 +639,11 @@ pub async fn run_live(
             false
         }
     };
-    let rest_source = RestPollingSource::new(&config.exchange.rest_url, all_token_ids);
+    let rest_source = RestPollingSource::new(&config.exchange.rest_url, all_token_ids, proxy, config.markets.rest_poll_timeout_ms);
     let mut live_source = HybridLiveSource::new(ws_source, rest_source, ws_enabled);
 
     // Set up live exchange client
-    let live_client = HttpWsExchangeClient::new(&config.exchange.rest_url, &config.exchange.ws_url)
+    let live_client = HttpWsExchangeClient::new(&config.exchange.rest_url, &config.exchange.ws_url, proxy)
         .with_client(pm_client, neg_risk_map);
 
     let mut cache = MarketDataCache::new(&market_symbols);
@@ -588,6 +679,8 @@ pub async fn run_live(
 
     let mut ticks_executed = 0;
     let data_timeout_ms = config.risk.heartbeat_timeout_ms.max(15_000) as u64;
+    let max_consecutive_data_timeouts = 6usize;
+    let mut consecutive_data_timeouts = 0usize;
     for _ in 0..ticks {
         if manual_stop.load(Ordering::Relaxed) {
             engine
@@ -604,18 +697,32 @@ pub async fn run_live(
         )
         .await
         {
-            Ok(Ok(e)) => e,
+            Ok(Ok(e)) => {
+                consecutive_data_timeouts = 0;
+                e
+            }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                engine.risk_mut().emergency_stop(format!(
-                    "market data timeout: no event within {}ms",
-                    data_timeout_ms
-                ));
                 logger.log_event(
                     "market_data_timeout",
-                    &serde_json::json!({ "timeout_ms": data_timeout_ms, "mode": mode }),
+                    &serde_json::json!({
+                        "timeout_ms": data_timeout_ms,
+                        "mode": mode,
+                        "consecutive": consecutive_data_timeouts + 1,
+                        "limit": max_consecutive_data_timeouts
+                    }),
                 )?;
-                break;
+                consecutive_data_timeouts = consecutive_data_timeouts.saturating_add(1);
+                if consecutive_data_timeouts >= max_consecutive_data_timeouts {
+                    engine.risk_mut().emergency_stop(format!(
+                        "market data timeout: no event within {}ms (consecutive timeouts: {}/{})",
+                        data_timeout_ms,
+                        consecutive_data_timeouts,
+                        max_consecutive_data_timeouts
+                    ));
+                    break;
+                }
+                continue;
             }
         };
         if let Some(snapshot) = cache.apply_event(event) {
@@ -630,8 +737,9 @@ pub async fn run_live(
                 .or_insert(snapshot.timestamp);
             if snapshot.timestamp >= *due {
                 let quote = strategy.generate_quote(&snapshot, inventory);
+                let local_now = Utc::now();
                 engine
-                    .process_quote(quote, snapshot.timestamp, &mut logger)
+                    .process_quote(quote, local_now, &mut logger)
                     .await?;
                 *due = snapshot.timestamp + Duration::milliseconds(strategy.refresh_interval_ms());
             }
@@ -689,14 +797,21 @@ struct RestPollingSource {
     client: PolymarketPublicClient,
     token_ids: Vec<String>,
     cursor: usize,
+    buffered: std::collections::VecDeque<crate::market_data::MarketEvent>,
+    batch_size: usize,
+    poll_timeout_ms: u64,
 }
 
 impl RestPollingSource {
-    fn new(rest_url: &str, token_ids: Vec<String>) -> Self {
+    fn new(rest_url: &str, token_ids: Vec<String>, proxy_url: Option<&str>, poll_timeout_ms: u64) -> Self {
+        let batch = token_ids.len().min(8).max(1);
         Self {
-            client: PolymarketPublicClient::new(rest_url),
+            client: PolymarketPublicClient::new(rest_url, proxy_url),
             token_ids,
             cursor: 0,
+            buffered: std::collections::VecDeque::new(),
+            batch_size: batch,
+            poll_timeout_ms,
         }
     }
 }
@@ -704,40 +819,71 @@ impl RestPollingSource {
 #[async_trait]
 impl MarketDataSource for RestPollingSource {
     async fn next_event(&mut self) -> Result<crate::market_data::MarketEvent> {
+        if let Some(evt) = self.buffered.pop_front() {
+            return Ok(evt);
+        }
         if self.token_ids.is_empty() {
             return Err(anyhow!("rest polling source has no tokens"));
         }
-        for _ in 0..self.token_ids.len() {
-            let token = self.token_ids[self.cursor % self.token_ids.len()].clone();
-            self.cursor = (self.cursor + 1) % self.token_ids.len();
-            let book = match self.client.get_orderbook(&token).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let best_bid = book.bids.first().map(|l| l.price_f64()).unwrap_or(0.0);
-            let best_ask = book.asks.first().map(|l| l.price_f64()).unwrap_or(0.0);
-            if !(best_bid > 0.0 && best_ask > 0.0 && best_ask > best_bid) {
-                continue;
-            }
-            let bid_size = book.bids.first().map(|l| l.size_f64()).unwrap_or(0.0);
-            let ask_size = book.asks.first().map(|l| l.size_f64()).unwrap_or(0.0);
-            let ts = book
-                .timestamp
-                .as_deref()
-                .and_then(parse_book_ts)
-                .unwrap_or_else(Utc::now);
-            return Ok(crate::market_data::MarketEvent::BookUpdate {
-                market: token,
-                bid: best_bid,
-                bid_size,
-                ask: best_ask,
-                ask_size,
-                timestamp: ts,
-            });
+        let n = self.token_ids.len();
+        let batch: Vec<String> = (0..self.batch_size)
+            .map(|_| {
+                let token = self.token_ids[self.cursor % n].clone();
+                self.cursor = (self.cursor + 1) % n;
+                token
+            })
+            .collect();
+
+        let poll_timeout_ms = self.poll_timeout_ms;
+        let futs: Vec<_> = batch
+            .into_iter()
+            .map(|token| {
+                let client = self.client.clone();
+                async move {
+                    let book = match timeout(
+                        StdDuration::from_millis(poll_timeout_ms),
+                        client.get_orderbook(&token),
+                    )
+                    .await
+                    {
+                        Ok(Ok(v)) => v,
+                        _ => return None,
+                    };
+                    let best_bid = book.bids.first().map(|l| l.price_f64()).unwrap_or(0.0);
+                    let best_ask = book.asks.first().map(|l| l.price_f64()).unwrap_or(0.0);
+                    if !(best_bid > 0.0 && best_ask > 0.0 && best_ask > best_bid) {
+                        return None;
+                    }
+                    if (best_ask - best_bid) > MAX_VALID_BOOK_SPREAD {
+                        return None;
+                    }
+                    let bid_size = book.bids.first().map(|l| l.size_f64()).unwrap_or(0.0);
+                    let ask_size = book.asks.first().map(|l| l.size_f64()).unwrap_or(0.0);
+                    let ts = book
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_book_ts)
+                        .unwrap_or_else(Utc::now);
+                    Some(crate::market_data::MarketEvent::BookUpdate {
+                        market: token,
+                        bid: best_bid,
+                        bid_size,
+                        ask: best_ask,
+                        ask_size,
+                        timestamp: ts,
+                    })
+                }
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(futs).await;
+        for evt in results.into_iter().flatten() {
+            self.buffered.push_back(evt);
         }
-        Err(anyhow!(
-            "no valid orderbook snapshot available from REST polling"
-        ))
+
+        self.buffered
+            .pop_front()
+            .ok_or_else(|| anyhow!("no valid orderbook snapshot available from REST polling"))
     }
 }
 
@@ -757,10 +903,11 @@ impl HybridLiveSource {
             ws,
             rest,
             ws_enabled,
-            ws_probe_timeout_ms: 600,
+            ws_probe_timeout_ms: 250,
             ws_reconnect_at: Instant::now(),
             ws_quiet_count: 0,
-            ws_quiet_disable_after: 20,
+            // Keep WS alive by default; use REST as gap-fill only.
+            ws_quiet_disable_after: 0,
         }
     }
 }
@@ -768,51 +915,60 @@ impl HybridLiveSource {
 #[async_trait]
 impl MarketDataSource for HybridLiveSource {
     async fn next_event(&mut self) -> Result<crate::market_data::MarketEvent> {
-        if !self.ws_enabled && Instant::now() >= self.ws_reconnect_at {
-            self.ws_enabled = true;
-        }
+        loop {
+            if !self.ws_enabled && Instant::now() >= self.ws_reconnect_at {
+                self.ws_enabled = true;
+            }
 
-        if self.ws_enabled {
-            // Probe WS briefly; if quiet, use REST for this tick without disabling WS.
-            match timeout(
-                StdDuration::from_millis(self.ws_probe_timeout_ms),
-                self.ws.next_event(),
-            )
-            .await
-            {
-                Ok(Ok(event)) => {
-                    self.ws_quiet_count = 0;
-                    return Ok(event);
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        "ws market data stream failed, falling back to REST polling: {}",
-                        err
-                    );
-                    self.ws_enabled = false;
-                    self.ws_reconnect_at = Instant::now() + StdDuration::from_secs(5);
-                }
-                Err(_) => {
-                    self.ws_quiet_count = self.ws_quiet_count.saturating_add(1);
-                    if self.ws_quiet_count >= self.ws_quiet_disable_after {
+            if self.ws_enabled {
+                // Probe WS briefly; if quiet, use REST for this tick without disabling WS.
+                match timeout(
+                    StdDuration::from_millis(self.ws_probe_timeout_ms),
+                    self.ws.next_event(),
+                )
+                .await
+                {
+                    Ok(Ok(event)) => {
+                        self.ws_quiet_count = 0;
+                        return Ok(event);
+                    }
+                    Ok(Err(err)) => {
                         warn!(
-                            "ws market data stream quiet ({} probes), pausing WS and using REST",
-                            self.ws_quiet_count
+                            "ws market data stream failed, falling back to REST polling: {}",
+                            err
                         );
                         self.ws_enabled = false;
                         self.ws_reconnect_at = Instant::now() + StdDuration::from_secs(5);
-                        self.ws_quiet_count = 0;
                     }
-                    if self.ws_quiet_count % 50 == 0 {
-                        warn!(
-                            "ws market data stream quiet ({} probes), using REST gap-fill",
-                            self.ws_quiet_count
-                        );
+                    Err(_) => {
+                        self.ws_quiet_count = self.ws_quiet_count.saturating_add(1);
+                        if self.ws_quiet_disable_after > 0
+                            && self.ws_quiet_count >= self.ws_quiet_disable_after
+                        {
+                            warn!(
+                                "ws market data stream quiet ({} probes), pausing WS and using REST",
+                                self.ws_quiet_count
+                            );
+                            self.ws_enabled = false;
+                            self.ws_reconnect_at = Instant::now() + StdDuration::from_secs(5);
+                            self.ws_quiet_count = 0;
+                        }
+                        if self.ws_quiet_count > 0 && self.ws_quiet_count % 50 == 0 {
+                            warn!(
+                                "ws market data stream quiet ({} probes), using REST gap-fill",
+                                self.ws_quiet_count
+                            );
+                        }
                     }
                 }
             }
+            match self.rest.next_event().await {
+                Ok(evt) => return Ok(evt),
+                Err(_err) => {
+                    tokio::time::sleep(StdDuration::from_millis(250)).await;
+                }
+            }
         }
-        self.rest.next_event().await
     }
 }
 
@@ -869,7 +1025,7 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
 ) -> Result<CoreLoopReport> {
     let mut cache = MarketDataCache::new(&markets);
     let mut strategy = MarketMakingStrategy::new(config.strategy.clone());
-    let news_overlay = NewsOverlay::new(config.news.clone());
+    let news_overlay = NewsOverlay::new(config.news.clone(), config.exchange.proxy_url.as_deref());
     let mut news_bias_by_market: HashMap<String, f64> = HashMap::new();
     let mut next_news_refresh_at = Utc::now();
     let risk = RiskEngine::new(config.risk.clone(), starting_cash);
@@ -908,7 +1064,9 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
     )?;
 
     let mut ticks_executed = 0;
-    let data_timeout_ms = config.risk.heartbeat_timeout_ms.max(15_000) as u64;
+    let data_timeout_ms = (config.markets.data_event_timeout_ms as i64).max(config.risk.heartbeat_timeout_ms) as u64;
+    let max_consecutive_data_timeouts = if mode == "paper-live" { 15usize } else { 1usize };
+    let mut consecutive_data_timeouts = 0usize;
     for _ in 0..ticks {
         if manual_stop.load(Ordering::Relaxed) {
             engine
@@ -925,7 +1083,10 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
         )
         .await
         {
-            Ok(Ok(e)) => e,
+            Ok(Ok(e)) => {
+                consecutive_data_timeouts = 0;
+                e
+            }
             Ok(Err(err)) => {
                 logger.log_event(
                     "data_source_exhausted",
@@ -934,15 +1095,26 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
                 break;
             }
             Err(_) => {
-                engine.risk_mut().emergency_stop(format!(
-                    "market data timeout: no event within {}ms",
-                    data_timeout_ms
-                ));
                 logger.log_event(
                     "market_data_timeout",
-                    &serde_json::json!({ "timeout_ms": data_timeout_ms, "mode": mode }),
+                    &serde_json::json!({
+                        "timeout_ms": data_timeout_ms,
+                        "mode": mode,
+                        "consecutive": consecutive_data_timeouts + 1,
+                        "limit": max_consecutive_data_timeouts
+                    }),
                 )?;
-                break;
+                consecutive_data_timeouts = consecutive_data_timeouts.saturating_add(1);
+                if consecutive_data_timeouts >= max_consecutive_data_timeouts {
+                    engine.risk_mut().emergency_stop(format!(
+                        "market data timeout: no event within {}ms (consecutive timeouts: {}/{})",
+                        data_timeout_ms,
+                        consecutive_data_timeouts,
+                        max_consecutive_data_timeouts
+                    ));
+                    break;
+                }
+                continue;
             }
         };
 
@@ -992,8 +1164,32 @@ async fn run_core_loop_with_source<S: MarketDataSource>(
                     .unwrap_or(0.0);
                 strategy.set_news_bias_bps(&snapshot.market, news_bps);
                 let quote = strategy.generate_quote(&snapshot, inventory);
+                let local_now = Utc::now();
+                logger.log_event(
+                    "feature_sample",
+                    &serde_json::json!({
+                        "mode": mode,
+                        "captured_at": local_now,
+                        "market": snapshot.market,
+                        "mid": snapshot.mid,
+                        "micro_price": snapshot.micro_price,
+                        "fair_value": snapshot.fair_value,
+                        "spread_bps": snapshot.spread_bps,
+                        "imbalance": snapshot.imbalance,
+                        "order_flow_signal": snapshot.order_flow_signal,
+                        "alpha_bps": snapshot.alpha_bps,
+                        "inventory": inventory,
+                        "news_bias_bps": news_bps,
+                        "quote_bid_price": quote.bid_price,
+                        "quote_ask_price": quote.ask_price,
+                        "quote_bid_size": quote.bid_size,
+                        "quote_ask_size": quote.ask_size,
+                        "market_bid": quote.market_bid,
+                        "market_ask": quote.market_ask
+                    }),
+                )?;
                 engine
-                    .process_quote(quote, snapshot.timestamp, logger)
+                    .process_quote(quote, local_now, logger)
                     .await?;
                 *due = snapshot.timestamp + Duration::milliseconds(strategy.refresh_interval_ms());
             }

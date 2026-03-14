@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info};
 
+use super::http::connect_ws_proxied;
 use super::types::{WsBookDelta, WsMessage, WsSubscription, WsTradeEvent};
 use crate::market_data::{MarketDataSource, MarketEvent};
 
@@ -38,6 +39,7 @@ pub struct PolymarketWsSource {
     unknown_frame_logs: u8,
     log_full_unknown_frames: bool,
     use_legacy_subscribe_payload: bool,
+    proxy_url: Option<String>,
 }
 
 impl PolymarketWsSource {
@@ -51,6 +53,7 @@ impl PolymarketWsSource {
         ws_url: impl Into<String>,
         token_ids: Vec<String>,
         token_to_market: std::collections::HashMap<String, String>,
+        proxy_url: Option<&str>,
     ) -> Self {
         Self {
             ws_url: ws_url.into(),
@@ -62,14 +65,16 @@ impl PolymarketWsSource {
             unknown_frame_logs: 0,
             log_full_unknown_frames: env_flag("AXELBOT_WS_LOG_FULL_UNKNOWN"),
             use_legacy_subscribe_payload: env_flag("AXELBOT_WS_USE_LEGACY_SUB"),
+            proxy_url: proxy_url.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         }
     }
 
     /// Connect to the WebSocket and subscribe to market channel.
     pub async fn connect(&mut self) -> Result<()> {
-        let (ws_stream, _response) = connect_async(&self.ws_url)
-            .await
-            .context("failed to connect to Polymarket WebSocket")?;
+        let (ws_stream, _response) =
+            connect_ws_proxied(&self.ws_url, self.proxy_url.as_deref())
+                .await
+                .context("failed to connect to Polymarket WebSocket")?;
 
         let (writer, reader) = ws_stream.split();
         self.writer = Some(writer);

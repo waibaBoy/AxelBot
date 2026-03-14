@@ -74,7 +74,9 @@ impl MarketMakingStrategy {
             .unwrap_or(0.0)
             / 10_000.0
             * snapshot.fair_value;
-        let centered_fair = snapshot.fair_value - inv_skew - depth_skew + news_shift;
+        let order_flow_shift = (snapshot.alpha_bps / 10_000.0) * snapshot.fair_value;
+        let centered_fair =
+            snapshot.fair_value - inv_skew - depth_skew + news_shift + order_flow_shift;
 
         let mut bid = centered_fair - spread * 0.5;
         let mut ask = centered_fair + spread * 0.5;
@@ -136,9 +138,12 @@ mod tests {
             ask: 0.51,
             ask_size: 12.0,
             mid: 0.5,
+            micro_price: 0.498,
             fair_value: 0.5,
             spread_bps: 400.0,
             imbalance: -0.09,
+            order_flow_signal: -0.05,
+            alpha_bps: -0.4,
             timestamp: Utc::now(),
         }
     }

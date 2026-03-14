@@ -6,11 +6,15 @@ api_key = ""
 api_secret = ""
 wallet_address = "0xYOUR_WALLET_ADDRESS"
 wallet_private_key = ""
+proxy_url = ""  # e.g. "socks5://user:pass@host:port" or "http://proxy:8080"
 
 [markets]
 selection_mode = "top_liquidity"
 refresh_secs = 30
-min_markets = 10
+book_probe_timeout_ms = 5000   # market discovery orderbook probe; raise to 60000 for VPN
+rest_poll_timeout_ms = 5000    # REST fallback poll per-book; raise to 60000 for VPN
+data_event_timeout_ms = 30000  # core loop heartbeat; raise to 120000 for VPN
+min_markets = 12
 symbols = [
   "POLY-MKT-001",
   "POLY-MKT-002",
@@ -28,7 +32,7 @@ symbols = [
 
 [risk]
 global_drawdown_stop_pct = 0.25
-max_per_market_exposure = 20.0
+max_per_market_exposure = 4.5
 max_total_exposure = 80.0
 max_open_orders = 120
 max_orders_per_sec = 25
@@ -44,11 +48,18 @@ post_only = true
 order_ttl_ms = 1500
 max_retries = 2
 fill_fee_bps = 2.0
+inventory_soft_limit_ratio = 0.20
+inventory_hard_limit_ratio = 0.33
+inventory_min_size_scale = 0.15
+inventory_flatten_boost = 3.00
+sim_fill_min_latency_ms = 80
+sim_fill_max_latency_ms = 350
+sim_slippage_bps = 1.5
 
 [strategy]
-target_spread_bps = 30.0
-inventory_skew_bps = 12.0
-quote_sizes = [1.0, 2.0, 3.0]
+target_spread_bps = 46.0
+inventory_skew_bps = 38.0
+quote_sizes = [0.35, 0.7, 1.05]
 refresh_interval_ms = 750
 
 [news]

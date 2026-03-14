@@ -5,17 +5,37 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 
 use crate::config::NewsConfig;
+use crate::polymarket::http::build_http_client;
 
 pub struct NewsOverlay {
     cfg: NewsConfig,
     http: reqwest::Client,
 }
 
+fn resilient_http_client(proxy_url: Option<&str>) -> reqwest::Client {
+    match build_http_client(proxy_url) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to build news HTTP client with proxy ({:?}): {}. falling back to direct client",
+                proxy_url, err
+            );
+            // Keep fallback deterministic: don't auto-read ambient *_PROXY env vars.
+            build_http_client(None).unwrap_or_else(|_| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            })
+        }
+    }
+}
+
 impl NewsOverlay {
-    pub fn new(cfg: NewsConfig) -> Self {
+    pub fn new(cfg: NewsConfig, proxy_url: Option<&str>) -> Self {
         Self {
+            http: resilient_http_client(proxy_url),
             cfg,
-            http: reqwest::Client::new(),
         }
     }
 

@@ -29,10 +29,19 @@ Risk-capped Rust market-making experiment scaffold for Polymarket-style predicti
   - Market data heartbeat timeout
   - Per-market circuit breaker on adverse slippage bursts
   - Manual emergency stop command (`STOP` on stdin)
+- Inventory protection in execution:
+  - Inventory-aware quote size damping near per-market risk limit
+  - Hard-side flattening when inventory approaches configured hard limit
+  - Pre-trade per-side size clipping to exposure headroom (reduces avoidable exposure-limit rejects)
+- Fair value and alpha inputs:
+  - Micro-price enhanced fair value in market data cache
+  - Short-horizon predictive order-flow signal (`order_flow_signal`, `alpha_bps`) used to skew quotes
+  - Optional news sentiment overlay (Guardian) applied as quote bias
 - Metrics and structured JSONL logs with:
   - Realized/unrealized PnL
   - Inventory by market
   - Average order latency
+  - Average fill latency
   - Quote uptime ratio
   - Cancel ratio
   - Average slippage bps
@@ -46,10 +55,16 @@ Risk-capped Rust market-making experiment scaffold for Polymarket-style predicti
    - `AXELBOT_API_SECRET`
    - `AXELBOT_WALLET_PRIVATE_KEY`
    - `AXELBOT_GUARDIAN_API_KEY`
+   - `AXELBOT_PROXY_URL` (optional, explicit proxy only)
    - `AXELBOT_NEWS_ENABLED`
    - `AXELBOT_KILL_SWITCH`
 
 The CLI auto-loads a local `.env` file on startup (via `dotenvy`).
+
+Proxy behavior:
+- AxelBot uses a proxy only when explicitly configured in `config.toml` (`exchange.proxy_url`) or `AXELBOT_PROXY_URL`.
+- Ambient system proxy vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) are ignored by default to keep startup deterministic.
+- For SOCKS5, verify the endpoint is reachable first (example: `Test-NetConnection 127.0.0.1 -Port 1080`).
 
 ### Backtest
 
@@ -137,7 +152,94 @@ cargo run -- paper --config config.toml --ticks 3000
 cargo run -- paper-live --config config.toml --ticks 3000
 ```
 
+Paper-live simulation realism is configurable in `[execution]`:
+- `sim_fill_min_latency_ms` / `sim_fill_max_latency_ms`
+- `sim_slippage_bps`
+- `inventory_soft_limit_ratio` / `inventory_hard_limit_ratio`
+- `inventory_min_size_scale` / `inventory_flatten_boost`
+
+### Paper tuning profile (2026-03-13 A)
+
+Current default paper-tuning profile in `config.toml`:
+- `risk.max_per_market_exposure = 8.0`
+- `execution.inventory_soft_limit_ratio = 0.30`
+- `execution.inventory_hard_limit_ratio = 0.50`
+- `execution.inventory_flatten_boost = 2.50`
+- `strategy.inventory_skew_bps = 24.0`
+- `strategy.target_spread_bps = 34.0`
+- `strategy.quote_sizes = [0.7, 1.4, 2.1]`
+
+Reference command:
+
+```powershell
+cargo run -- paper-live --config config.toml --ticks 300
+```
+
+Reference run output path to track tuning progression:
+- `logs\paper-live-20260313T015246.jsonl`
+
+### Paper tuning profile (2026-03-13 B)
+
+Profile used for the previous batch:
+- `risk.max_per_market_exposure = 6.0`
+- `execution.inventory_soft_limit_ratio = 0.25`
+- `execution.inventory_hard_limit_ratio = 0.40`
+- `execution.inventory_flatten_boost = 2.50`
+- `strategy.inventory_skew_bps = 30.0`
+- `strategy.target_spread_bps = 38.0`
+- `strategy.quote_sizes = [0.5, 1.0, 1.5]`
+
+Evaluation command:
+
+```powershell
+1..5 | ForEach-Object { cargo run -- paper-live --config config.toml --ticks 300 }
+```
+
+### Paper tuning profile (2026-03-13 C, current)
+
+Current active profile in `config.toml`:
+- `risk.max_per_market_exposure = 4.5`
+- `execution.inventory_soft_limit_ratio = 0.20`
+- `execution.inventory_hard_limit_ratio = 0.33`
+- `execution.inventory_flatten_boost = 3.00`
+- `strategy.inventory_skew_bps = 38.0`
+- `strategy.target_spread_bps = 46.0`
+- `strategy.quote_sizes = [0.35, 0.7, 1.05]`
+
+Evaluation command:
+
+```powershell
+1..5 | ForEach-Object { cargo run -- paper-live --config config.toml --ticks 300 }
+```
+
 Type `STOP` + Enter at any time to trigger manual emergency stop.
+
+## Offline model training (Colab-ready)
+
+AxelBot now logs `feature_sample` events during quote generation. Use these to train
+an offline short-horizon direction model.
+
+1. Generate paper-live logs:
+
+```powershell
+1..20 | ForEach-Object { cargo run -- paper-live --config config.toml --ticks 300 }
+```
+
+2. Export labeled CSV dataset:
+
+```powershell
+python scripts/export_feature_dataset.py --input "logs/paper-live-*.jsonl" --output "data/feature_dataset.csv" --horizon-events 3 --threshold-bps 2.0 --max-book-spread 0.50
+```
+
+`--max-book-spread` removes empty-book/sentinel transitions (for example `0.001/0.999`) from label generation.
+At runtime, AxelBot rejects extreme book updates (`> 0.90` absolute spread) before they enter `feature_sample` logs.
+
+3. Upload `data/feature_dataset.csv` to Colab and train a baseline model:
+- Start with logistic regression or gradient boosting.
+- Features: `micro_price`, `fair_value`, `spread_bps`, `imbalance`, `order_flow_signal`, `alpha_bps`, `inventory`, quote/market top-of-book fields.
+- Target: `label` (`-1`, `0`, `1`; neutral optional).
+
+4. Validate out-of-sample and compare MTM against the current rule-based baseline before enabling live signal usage.
 
 ### Live mode
 

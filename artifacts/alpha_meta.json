@@ -1,0 +1,14 @@
+{
+  "feature_columns": [
+    "micro_price_dev",
+    "fair_value_dev",
+    "spread_bps",
+    "imbalance",
+    "order_flow_signal",
+    "alpha_bps",
+    "inventory",
+    "news_bias_bps"
+  ],
+  "label_definition": "sign of forward return beyond threshold, mapped to binary up/down",
+  "threshold_note": "training notebook drops neutral labels (label==0)"
+}

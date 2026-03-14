@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
                 cfg.polymarket.chain_id,
                 nonce,
                 mode.into(),
+                cfg.exchange.proxy_url.as_deref(),
             )
             .await?;
 
@@ -204,7 +205,7 @@ async fn main() -> Result<()> {
             fidelity,
         } => {
             let cfg = AppConfig::from_path(&config)?;
-            let client = PolymarketPublicClient::new(&cfg.exchange.rest_url);
+            let client = PolymarketPublicClient::new(&cfg.exchange.rest_url, cfg.exchange.proxy_url.as_deref());
             let server_time = client.get_server_time().await?;
             let (fee_rate_bps, fee_error) = if let Some(token) = market.as_deref() {
                 match client.get_fee_rate_for_token(token).await {

@@ -27,10 +27,18 @@ fn risk_cfg() -> RiskConfig {
 
 fn execution_cfg() -> ExecutionConfig {
     ExecutionConfig {
+        unrecognized_fill_policy: axelbot::config::UnrecognizedFillPolicy::Drop,
         post_only: true,
         order_ttl_ms: 2_000,
         max_retries: 1,
         fill_fee_bps: 2.0,
+        inventory_soft_limit_ratio: 0.60,
+        inventory_hard_limit_ratio: 0.90,
+        inventory_min_size_scale: 0.15,
+        inventory_flatten_boost: 1.75,
+        sim_fill_min_latency_ms: 80,
+        sim_fill_max_latency_ms: 350,
+        sim_slippage_bps: 1.5,
     }
 }
 
@@ -47,6 +55,7 @@ fn build_engine() -> (ExecutionEngine<SimulatedExchangeClient>, JsonlLogger) {
 #[test]
 fn partial_fills_accumulate_inventory() {
     let (mut engine, mut logger) = build_engine();
+    engine.mint_test_order_id("order-1");
     let now = Utc::now();
 
     let fill1 = FillEvent {
@@ -80,6 +89,7 @@ fn partial_fills_accumulate_inventory() {
 #[test]
 fn out_of_order_fills_do_not_break_accounting() {
     let (mut engine, mut logger) = build_engine();
+    engine.mint_test_order_id("order-a");
     let now = Utc::now();
 
     let newer = FillEvent {
@@ -113,6 +123,7 @@ fn out_of_order_fills_do_not_break_accounting() {
 #[test]
 fn replayed_fill_is_ignored_by_fill_id() {
     let (mut engine, mut logger) = build_engine();
+    engine.mint_test_order_id("order-x");
     let now = Utc::now();
     let fill = FillEvent {
         fill_id: "dup-1".to_string(),
@@ -137,6 +148,7 @@ fn replayed_fill_is_ignored_by_fill_id() {
 #[test]
 fn cancel_race_fill_is_still_accounted() {
     let (mut engine, mut logger) = build_engine();
+    engine.mint_test_order_id("already-canceled-order");
     let now = Utc::now();
     let late_fill = FillEvent {
         fill_id: "late-fill".to_string(),

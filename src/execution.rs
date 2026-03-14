@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufWriter, Write},
@@ -8,14 +8,14 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::{
     sync::{mpsc, mpsc::error::TryRecvError, Mutex},
     time::{sleep, Duration as TokioDuration},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -57,6 +57,7 @@ pub trait ExchangeClient {
 pub struct HttpWsExchangeClient {
     pub rest_url: String,
     pub ws_url: String,
+    proxy_url: Option<String>,
     client: Option<Arc<crate::polymarket::client::PolymarketClient>>,
     nonce: crate::polymarket::nonce::NonceManager,
     /// Track which markets use neg_risk (condition_id → bool)
@@ -79,11 +80,12 @@ struct PendingOrderInfo {
 }
 
 impl HttpWsExchangeClient {
-    pub fn new(rest_url: impl Into<String>, ws_url: impl Into<String>) -> Self {
+    pub fn new(rest_url: impl Into<String>, ws_url: impl Into<String>, proxy_url: Option<&str>) -> Self {
         let (fill_tx, fill_rx) = mpsc::channel(1024);
         Self {
             rest_url: rest_url.into(),
             ws_url: ws_url.into(),
+            proxy_url: proxy_url.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             client: None,
             nonce: crate::polymarket::nonce::NonceManager::new(),
             neg_risk_map: HashMap::new(),
@@ -118,6 +120,7 @@ impl HttpWsExchangeClient {
             return;
         };
         let ws_url = user_ws_url(&self.ws_url);
+        let proxy_url = self.proxy_url.clone();
         let (api_key, api_secret, passphrase) = client.user_ws_auth();
         let tx = self.fill_tx.clone();
         let pending = Arc::clone(&self.pending_orders);
@@ -125,7 +128,7 @@ impl HttpWsExchangeClient {
         tokio::spawn(async move {
             let mut backoff_ms: u64 = (MIN_TRADE_POLL_INTERVAL_MS as u64).saturating_mul(2);
             loop {
-                let (ws_stream, _resp) = match connect_async(&ws_url).await {
+                let (ws_stream, _resp) = match crate::polymarket::http::connect_ws_proxied(&ws_url, proxy_url.as_deref()).await {
                     Ok(v) => {
                         backoff_ms = (MIN_TRADE_POLL_INTERVAL_MS as u64).saturating_mul(2);
                         v
@@ -400,6 +403,8 @@ pub struct ExecutionEngine<C: ExchangeClient> {
     risk: RiskEngine,
     portfolio: PortfolioSnapshot,
     open_orders: HashMap<String, OpenOrder>,
+    known_order_ids: HashSet<String>,
+    quarantined_fills: Vec<FillEvent>,
     fill_rx: mpsc::Receiver<FillEvent>,
     local_fill_model: bool,
     sim_tick: u64,
@@ -422,6 +427,8 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
             risk,
             portfolio: PortfolioSnapshot::with_starting_cash(starting_cash),
             open_orders: HashMap::new(),
+            known_order_ids: HashSet::new(),
+            quarantined_fills: Vec::new(),
             fill_rx,
             local_fill_model,
             sim_tick: 0,
@@ -442,12 +449,17 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
         &mut self.risk
     }
 
-    pub fn current_inventory(&self) -> HashMap<String, f64> {
-        self.portfolio
-            .positions
-            .iter()
-            .map(|(m, p)| (m.clone(), p.qty))
-            .collect()
+    pub fn open_orders_summary(&self) -> HashMap<String, (f64, f64)> {
+        let mut summary: HashMap<String, (f64, f64)> = HashMap::new();
+        for order in self.open_orders.values() {
+            let entry = summary.entry(order.market.clone()).or_insert((0.0, 0.0));
+            if order.side == Side::Bid {
+                entry.0 += order.remaining;
+            } else {
+                entry.1 += order.remaining;
+            }
+        }
+        summary
     }
 
     pub async fn process_quote(
@@ -459,12 +471,33 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
         self.metrics.cycles += 1;
         self.cancel_market_orders(&quote.market, logger).await?;
 
+        let inventory_before = self.portfolio.inventory_for(&quote.market);
+        let (adj_bid_size, adj_ask_size) =
+            self.adjust_quote_sizes_for_inventory(&quote.market, quote.bid_size, quote.ask_size);
+        if (adj_bid_size - quote.bid_size).abs() > f64::EPSILON
+            || (adj_ask_size - quote.ask_size).abs() > f64::EPSILON
+        {
+            logger.log_event(
+                "quote_inventory_adjusted",
+                &serde_json::json!({
+                    "market": quote.market,
+                    "inventory": inventory_before,
+                    "input_bid_size": quote.bid_size,
+                    "input_ask_size": quote.ask_size,
+                    "adjusted_bid_size": adj_bid_size,
+                    "adjusted_ask_size": adj_ask_size,
+                    "soft_ratio": self.cfg.inventory_soft_limit_ratio,
+                    "hard_ratio": self.cfg.inventory_hard_limit_ratio,
+                }),
+            )?;
+        }
+
         let bid_req = OrderRequest {
             market: quote.market.clone(),
             token_id: Some(quote.market.clone()),
             side: Side::Bid,
             price: quote.bid_price,
-            size: quote.bid_size,
+            size: adj_bid_size,
             quote_ts: quote.generated_at,
         };
         let ask_req = OrderRequest {
@@ -472,13 +505,73 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
             token_id: Some(quote.market.clone()),
             side: Side::Ask,
             price: quote.ask_price,
-            size: quote.ask_size,
+            size: adj_ask_size,
             quote_ts: quote.generated_at,
         };
 
-        let inventory = self.current_inventory();
+        let current_inventory: HashMap<String, f64> = self.portfolio
+            .positions
+            .iter()
+            .map(|(m, p)| (m.clone(), p.qty))
+            .collect();
+        let open_orders_summary = self.open_orders_summary();
+
         let mut accepted_any = false;
-        for req in [bid_req, ask_req] {
+        for mut req in [bid_req, ask_req] {
+            let m_inv = current_inventory.get(&req.market).copied().unwrap_or(0.0);
+            let (m_bids, m_asks) = open_orders_summary.get(&req.market).copied().unwrap_or((0.0, 0.0));
+            
+            let market_worst_case = if req.side == Side::Bid {
+                m_inv + m_bids
+            } else {
+                m_inv - m_asks
+            };
+
+            let clipped = self.clip_size_to_exposure_headroom(req.side, req.size, market_worst_case);
+            if clipped + f64::EPSILON < req.size {
+                logger.log_event(
+                    "order_resized",
+                    &serde_json::json!({
+                        "market": req.market,
+                        "side": req.side,
+                        "original_size": req.size,
+                        "resized_size": clipped,
+                        "reason": "exposure_headroom",
+                    }),
+                )?;
+            }
+            req.size = clipped;
+            if req.size < 0.01 {
+                logger.log_event(
+                    "order_skipped",
+                    &serde_json::json!({
+                        "market": req.market,
+                        "side": req.side,
+                        "reason": "min_size_or_exposure_headroom",
+                        "size": req.size,
+                    }),
+                )?;
+                continue;
+            }
+            if self.cfg.post_only {
+                let original = req.price;
+                req.price = self.post_only_reprice(&req, &quote);
+                if (req.price - original).abs() > f64::EPSILON {
+                    logger.log_event(
+                        "order_repriced",
+                        &serde_json::json!({
+                            "market": req.market,
+                            "side": req.side,
+                            "original_price": original,
+                            "repriced": req.price,
+                            "market_bid": quote.market_bid,
+                            "market_ask": quote.market_ask,
+                            "reason": "post_only_guard_adjustment",
+                        }),
+                    )?;
+                }
+            }
+
             if self.cfg.post_only && self.crosses_post_only_guard(&req, &quote) {
                 self.metrics.orders_rejected += 1;
                 logger.log_event(
@@ -496,7 +589,7 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
 
             let decision = self
                 .risk
-                .check_pre_trade(&req, now, &inventory, self.open_orders.len());
+                .check_pre_trade(&req, now, &current_inventory, &open_orders_summary, self.open_orders.len());
             if decision.allowed {
                 let ack = match self.place_order_with_retries(&req).await {
                     Ok(ack) => ack,
@@ -517,6 +610,7 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
                 };
                 self.metrics.orders_submitted += 1;
                 self.metrics.latency_ms_accum += ack.latency_ms;
+                self.known_order_ids.insert(ack.order_id.clone());
                 self.open_orders.insert(
                     ack.order_id.clone(),
                     OpenOrder {
@@ -646,10 +740,11 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
         now: DateTime<Utc>,
     ) -> Vec<FillEvent> {
         self.sim_tick = self.sim_tick.wrapping_add(1);
+        let sim_fill_min_latency_ms = self.cfg.sim_fill_min_latency_ms;
+        let sim_fill_max_latency_ms = self.cfg.sim_fill_max_latency_ms;
+        let sim_slippage_bps = self.cfg.sim_slippage_bps;
         let mut fills = Vec::new();
-        let mut completed = Vec::new();
-
-        for (id, order) in &mut self.open_orders {
+        for (id, order) in &self.open_orders {
             let mid = mid_prices
                 .get(&order.market)
                 .copied()
@@ -664,6 +759,14 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
             }
             .max(0.0);
             let age_ms = (now - order.placed_at).num_milliseconds().max(0);
+            let target_latency_ms = simulated_fill_latency_target_ms(
+                id,
+                sim_fill_min_latency_ms,
+                sim_fill_max_latency_ms,
+            );
+            if age_ms < target_latency_ms {
+                continue;
+            }
             let base_prob = if distance_bps <= 8.0 {
                 0.90
             } else if distance_bps <= 15.0 {
@@ -692,28 +795,29 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
             if fill_size <= 0.0 {
                 continue;
             }
-            order.remaining -= fill_size;
-            let fee_paid = fill_size * order.price * (self.cfg.fill_fee_bps / 10_000.0);
+            let expected_price = order.price;
+            let exec_price = simulated_fill_price(
+                order.side,
+                order.price,
+                distance_bps,
+                id,
+                self.sim_tick,
+                sim_slippage_bps,
+            );
+            let fee_paid = fill_size * exec_price * (self.cfg.fill_fee_bps / 10_000.0);
+            let fill_ts = (order.placed_at + ChronoDuration::milliseconds(target_latency_ms)).min(now);
 
             fills.push(FillEvent {
                 fill_id: Uuid::new_v4().to_string(),
                 order_id: id.clone(),
                 market: order.market.clone(),
                 side: order.side,
-                price: order.price,
+                price: exec_price,
                 size: fill_size,
-                expected_price: order.price,
+                expected_price,
                 fee_paid,
-                timestamp: now,
+                timestamp: fill_ts,
             });
-
-            if order.remaining <= 0.00001 {
-                completed.push(id.clone());
-            }
-        }
-
-        for id in completed {
-            self.open_orders.remove(&id);
         }
         fills
     }
@@ -723,6 +827,23 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
             logger.log_event("fill_duplicate_ignored", &fill)?;
             return Ok(());
         }
+        if !self.known_order_ids.contains(&fill.order_id) {
+            match self.cfg.unrecognized_fill_policy {
+                crate::config::UnrecognizedFillPolicy::Drop => {
+                    logger.log_event("unrecognized_fill_dropped", &fill)?;
+                    return Ok(());
+                }
+                crate::config::UnrecognizedFillPolicy::Quarantine => {
+                    logger.log_event("unrecognized_fill_quarantined", &fill)?;
+                    self.quarantined_fills.push(fill);
+                    return Ok(());
+                }
+                crate::config::UnrecognizedFillPolicy::Apply => {
+                    logger.log_event("unrecognized_fill_applied", &fill)?;
+                }
+            }
+        }
+
         self.metrics.fills += 1;
         let slip_bps = Self::slippage_bps(&fill);
         self.metrics.slippage_bps_accum += slip_bps;
@@ -867,6 +988,9 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
     }
 
     fn slippage_bps(fill: &FillEvent) -> f64 {
+        if fill.expected_price <= 0.0 || !fill.expected_price.is_finite() || !fill.price.is_finite() {
+            return 0.0;
+        }
         match fill.side {
             Side::Bid => ((fill.price - fill.expected_price) / fill.expected_price) * 10_000.0,
             Side::Ask => ((fill.expected_price - fill.price) / fill.expected_price) * 10_000.0,
@@ -883,6 +1007,83 @@ impl<C: ExchangeClient> ExecutionEngine<C> {
             Side::Ask => req.price <= quote.market_bid,
         }
     }
+
+    fn post_only_reprice(&self, req: &OrderRequest, quote: &QuoteProposal) -> f64 {
+        // Keep a small buffer from top-of-book so the order remains maker-side.
+        let buffer = 0.0005_f64;
+        let px = req.price.clamp(0.01, 0.99);
+        if !(quote.market_bid > 0.0 && quote.market_ask > 0.0 && quote.market_ask > quote.market_bid)
+        {
+            return px;
+        }
+        match req.side {
+            Side::Bid => px.min((quote.market_ask - buffer).clamp(0.01, 0.99)),
+            Side::Ask => px.max((quote.market_bid + buffer).clamp(0.01, 0.99)),
+        }
+    }
+
+    fn adjust_quote_sizes_for_inventory(
+        &self,
+        market: &str,
+        bid_size: f64,
+        ask_size: f64,
+    ) -> (f64, f64) {
+        let mut bid = bid_size.max(0.0);
+        let mut ask = ask_size.max(0.0);
+        let limit = self.risk.max_per_market_exposure().abs();
+        if limit <= f64::EPSILON {
+            return (bid, ask);
+        }
+
+        let inventory = self.portfolio.inventory_for(market);
+        let abs_inv = inventory.abs();
+        let soft = (self.cfg.inventory_soft_limit_ratio * limit).clamp(0.0, limit);
+        let hard = (self.cfg.inventory_hard_limit_ratio * limit).clamp(soft, limit);
+
+        if abs_inv > soft && hard > soft {
+            let t = ((abs_inv - soft) / (hard - soft)).clamp(0.0, 1.0);
+            let passive_scale = (1.0 - t * (1.0 - self.cfg.inventory_min_size_scale))
+                .clamp(self.cfg.inventory_min_size_scale, 1.0);
+            let flatten_scale =
+                1.0 + t * (self.cfg.inventory_flatten_boost.max(1.0) - 1.0);
+            if inventory > 0.0 {
+                bid *= passive_scale;
+                ask *= flatten_scale;
+            } else if inventory < 0.0 {
+                ask *= passive_scale;
+                bid *= flatten_scale;
+            }
+        }
+
+        if abs_inv >= hard && hard > 0.0 {
+            if inventory > 0.0 {
+                bid = 0.0;
+                ask *= self.cfg.inventory_flatten_boost.max(1.0);
+            } else if inventory < 0.0 {
+                ask = 0.0;
+                bid *= self.cfg.inventory_flatten_boost.max(1.0);
+            }
+        }
+
+        (bid, ask)
+    }
+
+    fn clip_size_to_exposure_headroom(&self, side: Side, desired: f64, worst_case_inventory: f64) -> f64 {
+        let desired = desired.max(0.0);
+        let limit = self.risk.max_per_market_exposure().abs();
+        if limit <= f64::EPSILON {
+            return desired;
+        }
+        let max_size = match side {
+            Side::Bid => limit - worst_case_inventory,
+            Side::Ask => worst_case_inventory + limit,
+        }
+        .max(0.0);
+        // Keep a tiny numerical cushion so projected inventory does not sit
+        // exactly on the boundary due to float rounding noise.
+        (desired.min(max_size) * 0.999).max(0.0)
+    }
+
 
     async fn place_order_with_retries(&mut self, req: &OrderRequest) -> Result<AckedOrder> {
         let max_attempts = self.cfg.max_retries.saturating_add(1);
@@ -927,6 +1128,52 @@ fn deterministic_roll(order_id: &str, tick: u64) -> f64 {
     }
     h ^= tick;
     (h % 10_000) as f64 / 10_000.0
+}
+
+fn simulated_fill_latency_target_ms(order_id: &str, min_latency_ms: i64, max_latency_ms: i64) -> i64 {
+    let min_ms = min_latency_ms.max(0);
+    let max_ms = max_latency_ms.max(min_ms);
+    if max_ms == min_ms {
+        return min_ms;
+    }
+    let roll = deterministic_roll(order_id, 0xA5A5_A5A5_A5A5_A5A5);
+    let span = (max_ms - min_ms) as f64;
+    min_ms + (span * roll).round() as i64
+}
+
+fn simulated_fill_price(
+    side: Side,
+    quoted_price: f64,
+    distance_bps: f64,
+    order_id: &str,
+    tick: u64,
+    sim_slippage_bps: f64,
+) -> f64 {
+    let slip_cap_bps = sim_slippage_bps.max(0.0);
+    if slip_cap_bps <= f64::EPSILON {
+        return quoted_price;
+    }
+
+    let roll_mag = deterministic_roll(order_id, tick ^ 0x9E37_79B1_85EB_CA87);
+    let roll_dir = deterministic_roll(order_id, tick ^ 0xC2B2_AE3D_27D4_EB4F);
+    let volatility_mult = (1.0 + (distance_bps / 40.0)).clamp(0.8, 2.0);
+    let mut slip_bps = slip_cap_bps * (0.25 + 0.75 * roll_mag) * volatility_mult;
+    slip_bps = slip_bps.min(slip_cap_bps * 2.0);
+
+    // Bias toward adverse execution while still allowing occasional favorable fills.
+    let signed_bps = if roll_dir < 0.75 {
+        match side {
+            Side::Bid => slip_bps,
+            Side::Ask => -slip_bps,
+        }
+    } else {
+        match side {
+            Side::Bid => -slip_bps * 0.5,
+            Side::Ask => slip_bps * 0.5,
+        }
+    };
+
+    (quoted_price * (1.0 + signed_bps / 10_000.0)).clamp(0.01, 0.99)
 }
 
 fn parse_trade_timestamp(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -1149,6 +1396,7 @@ mod tests {
     use crate::{
         config::{ExecutionConfig, RiskConfig},
         risk::RiskEngine,
+        strategy::QuoteProposal,
     };
 
     fn risk_cfg() -> RiskConfig {
@@ -1169,10 +1417,18 @@ mod tests {
 
     fn exec_cfg() -> ExecutionConfig {
         ExecutionConfig {
+            unrecognized_fill_policy: crate::config::UnrecognizedFillPolicy::Drop,
             post_only: true,
             order_ttl_ms: 2_000,
             max_retries: 1,
             fill_fee_bps: 2.0,
+            inventory_soft_limit_ratio: 0.60,
+            inventory_hard_limit_ratio: 0.90,
+            inventory_min_size_scale: 0.15,
+            inventory_flatten_boost: 1.75,
+            sim_fill_min_latency_ms: 80,
+            sim_fill_max_latency_ms: 350,
+            sim_slippage_bps: 1.5,
         }
     }
 
@@ -1183,6 +1439,25 @@ mod tests {
         let risk = RiskEngine::new(risk_cfg(), 1_000.0);
         let client = SimulatedExchangeClient::new(2.0);
         let mut engine = ExecutionEngine::new(client, exec_cfg(), risk, 1_000.0, true);
+
+        engine.known_order_ids.insert("o1".to_string());
+        engine.open_orders.insert("o1".to_string(), OpenOrder {
+            order_id: "o1".to_string(),
+            market: "M1".to_string(),
+            side: Side::Bid,
+            price: 0.40,
+            remaining: 10.0,
+            placed_at: Utc::now(),
+        });
+        engine.known_order_ids.insert("o2".to_string());
+        engine.open_orders.insert("o2".to_string(), OpenOrder {
+            order_id: "o2".to_string(),
+            market: "M1".to_string(),
+            side: Side::Ask,
+            price: 0.45,
+            remaining: 10.0,
+            placed_at: Utc::now(),
+        });
 
         let buy = FillEvent {
             fill_id: "f1".to_string(),
@@ -1212,4 +1487,77 @@ mod tests {
         assert!(engine.portfolio.realized_pnl > 0.45);
         assert!(engine.portfolio.realized_pnl < 0.55);
     }
+
+    #[tokio::test]
+    async fn post_only_reprice_reduces_cross_rejects() {
+        let tmp = tempdir().unwrap();
+        let mut logger = JsonlLogger::new(tmp.path(), "test").unwrap();
+        let risk = RiskEngine::new(risk_cfg(), 1_000.0);
+        let client = SimulatedExchangeClient::new(2.0);
+        let mut engine = ExecutionEngine::new(client, exec_cfg(), risk, 1_000.0, true);
+
+        let quote = QuoteProposal {
+            market: "M1".to_string(),
+            market_bid: 0.69,
+            market_ask: 0.70,
+            bid_price: 0.685,
+            ask_price: 0.640, // would be rejected without repricing
+            bid_size: 1.0,
+            ask_size: 1.0,
+            generated_at: Utc::now(),
+        };
+        engine
+            .process_quote(quote, Utc::now(), &mut logger)
+            .await
+            .unwrap();
+
+        let metrics = engine.metrics_snapshot();
+        assert_eq!(metrics.total_orders_rejected, 0);
+        assert_eq!(metrics.total_orders_submitted, 2);
+    }
+
+    #[tokio::test]
+    async fn exposure_headroom_resizing_avoids_exposure_rejects() {
+        let tmp = tempdir().unwrap();
+        let mut logger = JsonlLogger::new(tmp.path(), "test").unwrap();
+
+        let mut cfg = risk_cfg();
+        cfg.max_per_market_exposure = 1.0;
+        let risk = RiskEngine::new(cfg, 1_000.0);
+        let client = SimulatedExchangeClient::new(2.0);
+        let mut engine = ExecutionEngine::new(client, exec_cfg(), risk, 1_000.0, true);
+        engine.portfolio.positions.insert(
+            "M2".to_string(),
+            Position {
+                qty: 0.95,
+                avg_price: 0.5,
+            },
+        );
+
+        let quote = QuoteProposal {
+            market: "M2".to_string(),
+            market_bid: 0.40,
+            market_ask: 0.60,
+            bid_price: 0.45,
+            ask_price: 0.55,
+            bid_size: 0.40, // would exceed exposure without clipping
+            ask_size: 0.40,
+            generated_at: Utc::now(),
+        };
+        engine
+            .process_quote(quote, Utc::now(), &mut logger)
+            .await
+            .unwrap();
+
+        let metrics = engine.metrics_snapshot();
+        assert_eq!(metrics.total_orders_rejected, 0);
+        assert!(metrics.total_orders_submitted >= 1);
+    }
 }
+
+impl<C: crate::execution::ExchangeClient> crate::execution::ExecutionEngine<C> {
+    pub fn mint_test_order_id(&mut self, id: &str) {
+        self.known_order_ids.insert(id.to_string());
+    }
+}
+
